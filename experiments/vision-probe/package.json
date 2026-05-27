@@ -13,6 +13,7 @@
     "memory-report": "tsx src/cli.ts memory-report",
     "probe": "tsx src/cli.ts probe",
     "report": "tsx src/cli.ts report",
+    "wizard": "node vision-wizard.js",
     "test": "tsx src/tests.ts",
     "typecheck": "tsc --noEmit"
   },

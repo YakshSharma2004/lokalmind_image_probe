@@ -26,14 +26,19 @@ type OpenAIMessage =
 
 interface ChatCompletionResponse {
   choices?: Array<{
+    finish_reason?: unknown;
     message?: {
       content?: unknown;
+      role?: unknown;
     };
   }>;
   error?: {
     message?: string;
   };
+  usage?: unknown;
 }
+
+export type LlamaServerDebugLogger = (message: string) => void;
 
 export function mimeTypeForPath(filePath: string): string {
   const ext = extname(filePath).toLowerCase();
@@ -51,6 +56,7 @@ export class LlamaServerVisionAdapter {
   constructor(
     private readonly serverUrl: string,
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly debugLog?: LlamaServerDebugLogger,
   ) {}
 
   async initialize(): Promise<void> {
@@ -66,13 +72,18 @@ export class LlamaServerVisionAdapter {
     const modelsUrl = `${this.serverUrl.replace(/\/+$/, '')}/v1/models`;
 
     try {
+      this.debug(`[llama] GET ${healthUrl}`);
       const health = await this.fetchImpl(healthUrl, { signal: AbortSignal.timeout(5_000) });
+      this.debug(`[llama] /health HTTP ${health.status}`);
       if (health.ok) return;
     } catch {
+      this.debug('[llama] /health unavailable; trying /v1/models');
       // Some llama-server builds do not expose /health. Fall through to /v1/models.
     }
 
+    this.debug(`[llama] GET ${modelsUrl}`);
     const models = await this.fetchImpl(modelsUrl, { signal: AbortSignal.timeout(5_000) });
+    this.debug(`[llama] /v1/models HTTP ${models.status}`);
     if (!models.ok) {
       throw new Error(`llama-server is not reachable. /v1/models returned HTTP ${models.status}.`);
     }
@@ -83,15 +94,25 @@ export class LlamaServerVisionAdapter {
     config: ProbeRequestConfig,
   ): Promise<ProbeResponse> {
     const started = Date.now();
+    const openAiMessages = await Promise.all(messages.map((message) => this.toOpenAIMessage(message)));
     const payload = {
       model: config.model,
-      messages: await Promise.all(messages.map((message) => this.toOpenAIMessage(message))),
+      messages: openAiMessages,
       temperature: config.temperature,
       max_tokens: config.maxTokens,
       stream: false,
     };
+    const url = `${this.serverUrl.replace(/\/+$/, '')}/v1/chat/completions`;
 
-    const response = await this.fetchImpl(`${this.serverUrl.replace(/\/+$/, '')}/v1/chat/completions`, {
+    this.debug(
+      `[llama] POST ${url} model=${config.model} messages=${openAiMessages.length} ` +
+      `temperature=${config.temperature} max_tokens=${config.maxTokens} timeout_ms=${config.timeoutMs}`,
+    );
+    openAiMessages.forEach((message, index) => {
+      this.debug(`[llama] request message ${index + 1}: ${summarizeOpenAIMessage(message)}`);
+    });
+
+    const response = await this.fetchImpl(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -99,6 +120,9 @@ export class LlamaServerVisionAdapter {
     });
 
     const raw = await response.text();
+    this.debug(`[llama] HTTP ${response.status} ${response.statusText} latency_ms=${Date.now() - started} raw_chars=${raw.length}`);
+    this.debug(`[llama] raw preview: ${preview(raw, 1_000)}`);
+
     let parsed: ChatCompletionResponse;
     try {
       parsed = JSON.parse(raw) as ChatCompletionResponse;
@@ -111,8 +135,17 @@ export class LlamaServerVisionAdapter {
     }
 
     const content = parsed.choices?.[0]?.message?.content;
+    this.debug(
+      `[llama] parsed choices=${parsed.choices?.length ?? 0} ` +
+      `finish_reason=${String(parsed.choices?.[0]?.finish_reason ?? '(missing)')} ` +
+      `content_type=${typeof content} content_chars=${typeof content === 'string' ? content.length : '(n/a)'} ` +
+      `trimmed_chars=${typeof content === 'string' ? content.trim().length : '(n/a)'}`,
+    );
     if (typeof content !== 'string') {
       throw new Error('llama-server response did not include choices[0].message.content as a string.');
+    }
+    if (content.trim().length === 0) {
+      this.debug('[llama] WARNING: llama-server returned an empty or whitespace-only assistant message.');
     }
 
     return {
@@ -134,4 +167,26 @@ export class LlamaServerVisionAdapter {
       ],
     };
   }
+
+  private debug(message: string): void {
+    this.debugLog?.(message);
+  }
+}
+
+function summarizeOpenAIMessage(message: OpenAIMessage): string {
+  if (typeof message.content === 'string') {
+    return `role=${message.role} text_chars=${message.content.length} preview="${preview(message.content, 220)}"`;
+  }
+
+  const parts = message.content.map((part) => {
+    if (part.type === 'text') return `text_chars=${part.text.length}`;
+    return `image_url_chars=${part.image_url.url.length}`;
+  });
+  return `role=${message.role} multimodal_parts=${message.content.length} ${parts.join(' ')}`;
+}
+
+function preview(value: string, maxLength: number): string {
+  const singleLine = value.replace(/\s+/g, ' ').trim();
+  if (singleLine.length <= maxLength) return singleLine;
+  return `${singleLine.slice(0, maxLength)}...`;
 }

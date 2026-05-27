@@ -86,6 +86,7 @@ export interface VisionProbeSettings {
   serverUrl?: string;
   lastModelId?: string;
   lastFixtureDir?: string;
+  llamaServerBin?: string;
   localModelPaths?: Record<string, string>;
   downloadedModels?: Record<string, DownloadedModelState>;
   downloadedEmbeddingModel?: DownloadedModelState;

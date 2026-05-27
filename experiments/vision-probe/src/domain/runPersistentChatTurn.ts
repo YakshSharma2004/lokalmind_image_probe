@@ -21,6 +21,7 @@ export interface RunPersistentChatTurnParams {
   temperature: number;
   maxTokens: number;
   timeoutMs: number;
+  debugLog?: ((message: string) => void) | undefined;
 }
 
 export interface PersistentChatTurnResult {
@@ -29,10 +30,14 @@ export interface PersistentChatTurnResult {
   contextMessageCount: number;
   relevantMemoryCount: number;
   summaryCount: number;
+  responseLatencyMs: number | null;
+  assistantTextLength: number;
+  assistantTextTrimmedLength: number;
 }
 
 export async function runPersistentChatTurn(params: RunPersistentChatTurnParams): Promise<PersistentChatTurnResult> {
   const history = await params.chatRepository.getMessages(persistentChatSessionId);
+  params.debugLog?.(`[chat] loaded history messages=${history.length}`);
   const now = Date.now();
   const userMessage: PersistentChatMessage = {
     id: `msg_${now}_${randomUUID()}_user`,
@@ -43,6 +48,7 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     createdAt: now,
   };
   await params.chatRepository.saveMessage(userMessage);
+  params.debugLog?.(`[chat] saved user message id=${userMessage.id} chars=${userMessage.content.length}`);
 
   const { historyOnly, currentMessage } = buildCappedLlmTurns(history, userMessage);
   const modeOverride = await params.appSettingsRepository.getModeSystemPromptOverride(params.mode);
@@ -51,6 +57,11 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
   const summaries = await params.memoryRepository.getSessionSummaries(persistentChatSessionId);
   const memories = await params.memoryService.getRelevantMemories(userMessage.content, history.length);
   const systemPrompt = resolveSystemPromptForChat(params.mode, modeOverride);
+  params.debugLog?.(
+    `[chat] context inputs mode=${params.mode} history_included=${historyOnly.length} ` +
+    `summaries=${summaries.length} relevant_memories=${memories.length} ` +
+    `pinned_chars=${pinnedFacts.length} profile_chars=${userProfile.length}`,
+  );
 
   const llmMessages = buildContextMessages({
     systemPrompt,
@@ -61,10 +72,22 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     history: historyOnly,
     currentMessage,
   });
+  params.debugLog?.(`[chat] built context messages=${llmMessages.length}`);
+  llmMessages.forEach((message, index) => {
+    params.debugLog?.(
+      `[chat] context ${index + 1}: role=${message.role} chars=${message.content.length} ` +
+      `preview="${preview(message.content, 260)}"`,
+    );
+  });
 
   let assistantText = '';
   let assistantStatus: PersistentChatMessage['status'] = 'done';
+  let responseLatencyMs: number | null = null;
   try {
+    params.debugLog?.(
+      `[chat] sending generation request model=${params.modelId} ` +
+      `temperature=${params.temperature} max_tokens=${params.maxTokens} timeout_ms=${params.timeoutMs}`,
+    );
     const response = await params.llmAdapter.generateResponse(llmMessages, {
       model: params.modelId,
       temperature: params.temperature,
@@ -72,9 +95,19 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
       timeoutMs: params.timeoutMs,
     });
     assistantText = response.text;
+    responseLatencyMs = response.latencyMs;
+    params.debugLog?.(
+      `[chat] generation completed latency_ms=${response.latencyMs} ` +
+      `text_chars=${assistantText.length} trimmed_chars=${assistantText.trim().length} ` +
+      `preview="${preview(assistantText, 500)}"`,
+    );
+    if (assistantText.trim().length === 0) {
+      params.debugLog?.('[chat] WARNING: final assistant text is empty or whitespace-only.');
+    }
   } catch (error) {
     assistantStatus = 'error';
     assistantText = error instanceof Error ? error.message : String(error);
+    params.debugLog?.(`[chat] generation error: ${assistantText}`);
   }
 
   const assistantMessage: PersistentChatMessage = {
@@ -86,11 +119,16 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     createdAt: Date.now(),
   };
   await params.chatRepository.saveMessage(assistantMessage);
+  params.debugLog?.(
+    `[chat] saved assistant message id=${assistantMessage.id} status=${assistantMessage.status} ` +
+    `chars=${assistantMessage.content.length}`,
+  );
 
   if (assistantStatus === 'error') {
     throw new Error(assistantText || 'LLM generation failed');
   }
 
+  params.debugLog?.('[chat] running memory maintenance if needed');
   await maybeRunMemoryMaintenance({
     chatRepository: params.chatRepository,
     memoryRepository: params.memoryRepository,
@@ -100,6 +138,7 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     modelId: params.modelId,
     timeoutMs: params.timeoutMs,
   });
+  params.debugLog?.('[chat] memory maintenance completed');
 
   return {
     userMessage,
@@ -107,5 +146,14 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     contextMessageCount: llmMessages.length,
     relevantMemoryCount: memories.length,
     summaryCount: summaries.length,
+    responseLatencyMs,
+    assistantTextLength: assistantText.length,
+    assistantTextTrimmedLength: assistantText.trim().length,
   };
+}
+
+function preview(value: string, maxLength: number): string {
+  const singleLine = value.replace(/\s+/g, ' ').trim();
+  if (singleLine.length <= maxLength) return singleLine;
+  return `${singleLine.slice(0, maxLength)}...`;
 }

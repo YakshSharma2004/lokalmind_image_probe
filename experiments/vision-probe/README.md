@@ -45,6 +45,14 @@ npm install
 npm run generate-fixtures
 ```
 
+For the guided workflow, run:
+
+```powershell
+npm run wizard
+```
+
+The wizard can download models, configure `llama-server.exe`, run chat, run image probes, and print reports.
+
 Always pass CLI flags after `--`:
 
 ```powershell
@@ -69,6 +77,9 @@ qwen3.5-4b
 qwen3-4b
 gemma3-4b
 gemma3-4b-vision
+smolvlm-256m-vision
+smolvlm2-2.2b-vision
+qwen2.5-vl-3b-vision
 ```
 
 For app catalog models, set the CDN base URL first:
@@ -181,6 +192,14 @@ npm run probe -- --model gemma3-4b-vision --server http://127.0.0.1:8082
 npm run report
 ```
 
+Other registered vision model ids:
+
+```text
+smolvlm-256m-vision
+smolvlm2-2.2b-vision
+qwen2.5-vl-3b-vision
+```
+
 Each probe runs four image tests and four no-image controls.
 
 The prompts are:
@@ -279,6 +298,7 @@ The registry expected byte size does not match the actual file. Update `sizeByte
 
 ```text
 npm run generate-fixtures
+npm run wizard
 npm run list-models
 npm run download-model -- --model <id>
 npm run download-embedding

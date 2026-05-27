@@ -79,6 +79,7 @@ interface ParsedArgs {
   contextSize?: number;
   keepServerAlive?: boolean;
   force?: boolean;
+  debug?: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -194,6 +195,9 @@ function parseArgs(argv: string[]): ParsedArgs {
       case '--force':
         args.force = true;
         break;
+      case '--debug':
+        args.debug = true;
+        break;
       case '--with-app-context':
         args.withAppContext = true;
         break;
@@ -238,10 +242,16 @@ Options:
   --context-size <number>  Default: model registry value or 8192
   --keep-server-alive      Leave spawned llama-server running after probe
   --with-app-context       Reserved for a follow-up mode; v1 probes stay deterministic
+  --debug                  Print request/context/response diagnostics
 
 Recommended server:
   llama-server -hf ggml-org/gemma-3-4b-it-GGUF -c 8192 --port 8080
 `);
+}
+
+function createDebugLogger(enabled: boolean | undefined): ((message: string) => void) | undefined {
+  if (!enabled && process.env.VISION_PROBE_DEBUG !== '1') return undefined;
+  return (message) => console.log(`[debug] ${message}`);
 }
 
 function resolveFromCwd(path: string): string {
@@ -366,6 +376,7 @@ async function runProbe(args: ParsedArgs): Promise<number> {
   const temperature = args.temperature ?? defaultProbeConfig.temperature;
   const maxTokens = args.maxTokens ?? defaultProbeConfig.maxTokens;
   const timeoutMs = args.timeoutMs ?? defaultProbeConfig.timeoutMs;
+  const debugLog = createDebugLogger(args.debug);
 
   await verifyFixtures(fixtureDir);
 
@@ -399,7 +410,7 @@ async function runProbe(args: ParsedArgs): Promise<number> {
   });
 
   const { driver, repository } = await createRepository();
-  const adapter = new LlamaServerVisionAdapter(serverUrl);
+  const adapter = new LlamaServerVisionAdapter(serverUrl, fetch, debugLog);
   const runId = randomUUID();
   try {
     await adapter.initialize();
@@ -659,13 +670,23 @@ async function runChat(args: ParsedArgs): Promise<number> {
   let serverUrl = args.server ?? '';
   let embeddingServerUrl = args.embeddingServer ?? '';
   let driver: NodeSQLiteDriver | null = null;
+  const debugLog = createDebugLogger(args.debug);
 
   try {
+    debugLog?.(
+      `[chat-cli] start model=${args.model} mode=${args.mode ?? 'general'} ` +
+      `auto_server=${Boolean(args.autoServer)} server=${args.server ?? '(auto)'} ` +
+      `auto_embedding=${Boolean(args.autoEmbeddingServer)} embedding_server=${args.embeddingServer ?? '(none)'}`,
+    );
     if (args.autoServer) {
       const artifact = getModelArtifact(args.model);
       const downloaded = resolveDownloadedModel(settings, args.model);
       await verifyDownloadedFiles(artifact, downloaded);
       const port = args.port ?? await getFreePort();
+      debugLog?.(
+        `[chat-cli] starting llama-server bin=${args.llamaServerBin ?? 'llama-server'} ` +
+        `model_path=${downloaded.modelPath} port=${port} context=${args.contextSize ?? artifact.contextSize}`,
+      );
       managedChatServer = await startManagedLlamaServer({
         llamaServerBin: args.llamaServerBin ?? 'llama-server',
         artifact,
@@ -674,12 +695,17 @@ async function runChat(args: ParsedArgs): Promise<number> {
         contextSize: args.contextSize ?? artifact.contextSize,
       });
       serverUrl = managedChatServer.serverUrl;
+      debugLog?.(`[chat-cli] llama-server ready at ${serverUrl}`);
     }
 
     if (args.autoEmbeddingServer) {
       const downloadedEmbedding = resolveDownloadedEmbedding(settings);
       await verifyDownloadedFiles(embeddingArtifact, downloadedEmbedding);
       const port = args.embeddingPort ?? await getFreePort();
+      debugLog?.(
+        `[chat-cli] starting embedding server bin=${args.llamaServerBin ?? 'llama-server'} ` +
+        `model_path=${downloadedEmbedding.modelPath} port=${port}`,
+      );
       managedEmbeddingServer = await startManagedEmbeddingServer({
         llamaServerBin: args.llamaServerBin ?? 'llama-server',
         modelPath: downloadedEmbedding.modelPath,
@@ -688,6 +714,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
         pooling: args.embeddingPooling ?? 'mean',
       });
       embeddingServerUrl = managedEmbeddingServer.serverUrl;
+      debugLog?.(`[chat-cli] embedding server ready at ${embeddingServerUrl}`);
     }
 
     await kv.merge({
@@ -704,10 +731,12 @@ async function runChat(args: ParsedArgs): Promise<number> {
       const embeddingAdapter = new LlamaServerEmbeddingAdapter(embeddingServerUrl);
       await embeddingAdapter.initialize();
       memoryService.setEmbeddingService(embeddingAdapter);
+      debugLog?.('[chat-cli] embedding adapter initialized');
     }
 
-    const llmAdapter = new LlamaServerVisionAdapter(serverUrl);
+    const llmAdapter = new LlamaServerVisionAdapter(serverUrl, fetch, debugLog);
     await llmAdapter.initialize();
+    debugLog?.('[chat-cli] LLM adapter initialized');
 
     const result = await runPersistentChatTurn({
       chatRepository: repositories.chatRepository,
@@ -719,8 +748,9 @@ async function runChat(args: ParsedArgs): Promise<number> {
       message: args.message,
       mode: args.mode ?? 'general',
       temperature: args.temperature ?? 0.7,
-      maxTokens: args.maxTokens ?? 512,
+      maxTokens: args.maxTokens ?? 1024,
       timeoutMs: args.timeoutMs ?? defaultProbeConfig.timeoutMs,
+      debugLog,
     });
 
     console.log(`Model: ${args.model} (${modelLabelFor(args.model)})`);
@@ -734,6 +764,14 @@ async function runChat(args: ParsedArgs): Promise<number> {
     }
     console.log(`Context messages: ${result.contextMessageCount}`);
     console.log(`Relevant memories: ${result.relevantMemoryCount}`);
+    if (debugLog) {
+      console.log(`Response latency ms: ${result.responseLatencyMs ?? '(none)'}`);
+      console.log(`Assistant chars: ${result.assistantTextLength}`);
+      console.log(`Assistant trimmed chars: ${result.assistantTextTrimmedLength}`);
+    }
+    if (result.assistantTextTrimmedLength === 0) {
+      console.log('Warning: model returned an empty assistant message. Run with --debug or check the debug lines above.');
+    }
     console.log('');
     console.log(result.assistantMessage.content);
     return 0;
