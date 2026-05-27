@@ -1,0 +1,31 @@
+{
+  "name": "lokalmind-vision-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate-fixtures": "tsx src/fixtures/generateFixtures.ts",
+    "download-model": "tsx src/cli.ts download-model",
+    "download-embedding": "tsx src/cli.ts download-embedding",
+    "list-models": "tsx src/cli.ts list-models",
+    "print-server-command": "tsx src/cli.ts print-server-command",
+    "chat": "tsx src/cli.ts chat",
+    "memory-report": "tsx src/cli.ts memory-report",
+    "probe": "tsx src/cli.ts probe",
+    "report": "tsx src/cli.ts report",
+    "test": "tsx src/tests.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "@types/pngjs": "^6.0.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=26.0.0"
+  }
+}
