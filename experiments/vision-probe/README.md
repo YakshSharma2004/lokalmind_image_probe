@@ -1,122 +1,65 @@
 # LokalMind Vision Probe
 
-Desktop-only experiment for testing whether local GGUF models can process real image input through `llama.cpp` `llama-server`.
+Desktop experiment for running local GGUF models through `llama.cpp` `llama-server`.
 
-This does not change the mobile app. The current app runtime is text-only at the `llama.rn` boundary: `LLMMessage.imagePath` exists, but the production adapter sends only `{ role, content }`. This probe mirrors the app's local-first backend shape with desktop adapters.
+It supports two workflows:
+
+- Persistent chat with app-style memory stored in SQLite.
+- Image probes that test whether a model can process real image input.
+
+This does not change the production mobile app.
+
+## Requirements
+
+- Node.js 26 or newer
+- npm
+- `llama-server` from `llama.cpp`
+- GGUF model files
+
+On Windows, install `llama.cpp` with:
+
+```powershell
+winget install --id ggml.llamacpp --exact
+```
+
+Check that `llama-server` works:
+
+```powershell
+llama-server --version
+```
+
+If it is not on PATH, use the full path:
+
+```powershell
+$llama = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama-server.exe"
+& $llama --version
+```
 
 ## Setup
 
-```bash
-cd experiments/vision-probe
+Run commands from the experiment root, not from `src`.
+
+```powershell
+cd "C:\Users\ysharma1\OneDrive - Red Deer College\Documents\GitHub\lokalmind-app\experiments\vision-probe"
 npm install
 npm run generate-fixtures
 ```
 
-Download the default vision model and projector:
-
-```bash
-npm run download-model -- --model gemma3-4b-vision
-```
-
-Download the app-style semantic memory embedding model:
+Always pass CLI flags after `--`:
 
 ```powershell
-npm run download-embedding
+npm run chat -- --model qwen3.5-0.8b --message "Hello"
 ```
 
-The app catalog text models are also registered. They use the same CDN path pattern as the mobile app:
+## Download Models
 
-```text
-<base-url>/models/<model-id>/<filename>
-```
-
-Set the base URL before downloading one of those models:
+List registered models:
 
 ```powershell
-$env:VISION_PROBE_MODEL_BASE_URL="https://your-model-cdn.example"
-npm run download-model -- --model qwen3.5-0.8b
-```
-
-`HETZNER_BASE_URL` and `HETZNER_WEBDAV_URL` are also accepted if those are already set in your shell.
-
-Run the probe with a managed `llama-server` process:
-
-```bash
-npm run probe -- --model gemma3-4b-vision --auto-server
-npm run report
-```
-
-Run one persistent chat turn with app-style memory/context:
-
-```powershell
-npm run chat -- --model qwen3.5-0.8b --auto-server --auto-embedding-server --message "My name is Yaksh and I am testing local model memory."
-npm run memory-report
-```
-
-The CLI assumes `llama-server` is available on `PATH`. Use a custom binary path when needed:
-
-```bash
-npm run probe -- --model gemma3-4b-vision --auto-server --llama-server-bin C:\path\to\llama-server.exe
-```
-
-The same custom binary option works for chat and the embedding server:
-
-```powershell
-npm run chat -- --model qwen3.5-0.8b --auto-server --auto-embedding-server --llama-server-bin C:\path\to\llama-server.exe --message "What do you remember about me?"
-```
-
-## Manual Server Mode
-
-You can still start a multimodal `llama-server` separately:
-
-```bash
-llama-server -hf ggml-org/gemma-3-4b-it-GGUF -c 8192 --port 8080
-```
-
-Manual local model/projector mode:
-
-```bash
-llama-server -m <model.gguf> --mmproj <mmproj.gguf> -c 8192 --port 8080
-```
-
-## Run
-
-```bash
-npm run probe -- --model gemma3-4b-vision --server http://127.0.0.1:8080
-npm run report
-```
-
-Useful options:
-
-```bash
-npm run probe -- \
-  --model gemma3-4b-vision \
-  --auto-server \
-  --fixtures .data/fixtures \
-  --temperature 0 \
-  --max-tokens 128 \
-  --timeout-ms 120000 \
-  --context-size 8192
-```
-
-Helpful model commands:
-
-```bash
 npm run list-models
-npm run print-server-command -- --model gemma3-4b-vision
 ```
 
-Persistent chat commands:
-
-```powershell
-npm run chat -- --model qwen3.5-0.8b --auto-server --message "Hello"
-npm run chat -- --model qwen3.5-0.8b --auto-server --auto-embedding-server --message "What was I working on before?"
-npm run memory-report
-```
-
-The chat command stores raw chat rows in SQLite, rolling summaries in `session_summaries`, and memory checkpoints in `session_memories`. Embeddings are stored only on `session_memories.embedding` and are used for semantic retrieval.
-
-Registered app catalog model ids:
+Registered app catalog models:
 
 ```text
 qwen3.5-0.8b
@@ -125,34 +68,224 @@ deepseek-r1-1.5b
 qwen3.5-4b
 qwen3-4b
 gemma3-4b
+gemma3-4b-vision
 ```
 
-## What Counts As Vision-Capable
+For app catalog models, set the CDN base URL first:
 
-The harness runs each deterministic image test twice: with the image and without the image. A model only counts as vision-capable if it answers the image-grounded tests correctly and clearly beats the no-image control.
+```powershell
+$env:VISION_PROBE_MODEL_BASE_URL="https://your-model-cdn-base-url"
+```
 
-The probe stores runs and results in:
+Download a model:
+
+```powershell
+npm run download-model -- --model deepseek-r1-1.5b
+```
+
+Download the embedding model used for semantic memory:
+
+```powershell
+npm run download-embedding
+```
+
+If a model is not on your CDN, add it to `src/domain/modelArtifacts.ts` with a direct `modelUrl`.
+
+Example:
+
+```ts
+'custom-model': {
+  id: 'custom-model',
+  label: 'Custom Model',
+  filename: 'custom-model-Q4_K_M.gguf',
+  modelUrl: 'https://huggingface.co/org/repo/resolve/main/custom-model-Q4_K_M.gguf',
+  sizeBytes: 1234567890,
+  requiresMmproj: false,
+  contextSize: 8192,
+  notes: 'External GGUF model.',
+},
+```
+
+For a vision model, also add `mmprojFilename`, `mmprojUrl`, and set `requiresMmproj: true`.
+
+## Start Servers Manually
+
+In this Windows environment, Node may fail to spawn `llama-server` with `spawn EPERM`. Manual server mode avoids that.
+
+Set the executable path:
+
+```powershell
+$llama = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama-server.exe"
+```
+
+Start the chat model in Terminal 1:
+
+```powershell
+& $llama -m ".\.data\models\deepseek-r1-1.5b\DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf" -c 8192 --host 127.0.0.1 --port 8080
+```
+
+Start the embedding model in Terminal 2:
+
+```powershell
+& $llama -m ".\.data\models\all-minilm-l6-v2\all-MiniLM-L6-v2-Q4_K_M.gguf" --embedding --pooling mean -c 512 --host 127.0.0.1 --port 8081
+```
+
+For the Gemma vision model, start a separate server:
+
+```powershell
+& $llama -m ".\.data\models\gemma3-4b-vision\gemma-3-4b-it-Q4_K_M.gguf" --mmproj ".\.data\models\gemma3-4b-vision\mmproj-model-f16.gguf" -c 8192 --host 127.0.0.1 --port 8082
+```
+
+## Run Persistent Chat
+
+Run chat in another terminal:
+
+```powershell
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --embedding-server http://127.0.0.1:8081 --message "My name is Yaksh and I am testing local model memory."
+```
+
+Without embeddings:
+
+```powershell
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --no-embeddings --message "Hello"
+```
+
+Check stored chat and memory:
+
+```powershell
+npm run memory-report
+```
+
+The chat flow stores:
+
+```text
+chat_messages              raw persistent chat history
+session_summaries          rolling 20-message summaries
+session_memories           memory checkpoints
+session_memories.embedding semantic vectors for memory retrieval
+```
+
+## Run Image Probe
+
+Probe a text model:
+
+```powershell
+npm run probe -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080
+npm run report
+```
+
+Probe the vision model:
+
+```powershell
+npm run probe -- --model gemma3-4b-vision --server http://127.0.0.1:8082
+npm run report
+```
+
+Each probe runs four image tests and four no-image controls.
+
+The prompts are:
+
+```text
+shapes-basic:
+List the visible shapes and their colors.
+
+spatial-left-right:
+What object is on the left, and what object is on the right?
+
+ocr-simple:
+What exact text appears in the image?
+
+counting-grid:
+How many black dots and orange rectangles are visible?
+```
+
+The system prompt is:
+
+```text
+You are a precise visual inspection assistant. Answer only from the provided image. Keep the answer short and literal.
+```
+
+## Auto Server Mode
+
+If Node can spawn child processes on your machine, you can use auto server mode:
+
+```powershell
+npm run chat -- --model deepseek-r1-1.5b --auto-server --auto-embedding-server --message "Hello"
+```
+
+```powershell
+npm run probe -- --model gemma3-4b-vision --auto-server
+```
+
+If you see `spawn EPERM`, use manual server mode instead.
+
+## Data Files
+
+SQLite database:
 
 ```text
 .data/vision-probe.db
 ```
 
-Small settings live in:
+Settings:
 
 ```text
 .data/settings.json
 ```
 
+Downloaded models:
+
+```text
+.data/models/
+```
+
+Generated image fixtures:
+
+```text
+.data/fixtures/
+```
+
+## Common Problems
+
+`Unknown option: qwen3.5-0.8b`
+
+You forgot the npm argument separator. Use:
+
+```powershell
+npm run chat -- --model qwen3.5-0.8b
+```
+
+`Model uses the app model CDN`
+
+Set the CDN base URL:
+
+```powershell
+$env:VISION_PROBE_MODEL_BASE_URL="https://your-model-cdn-base-url"
+```
+
+`spawn llama-server ENOENT`
+
+`llama-server` is not on PATH. Use the full exe path or manual server mode.
+
+`spawn EPERM`
+
+Node is blocked from launching `llama-server`. Start `llama-server` manually and pass `--server`.
+
+Downloaded size mismatch
+
+The registry expected byte size does not match the actual file. Update `sizeBytes` in `src/domain/modelArtifacts.ts`, then rerun with `--force`.
+
 ## Scripts
 
-- `npm run generate-fixtures` creates deterministic PNG test images.
-- `npm run download-model` downloads the configured GGUF and mmproj files into `.data/models/`.
-- `npm run download-embedding` downloads the MiniLM embedding GGUF for semantic memory.
-- `npm run list-models` shows configured probe models and download state.
-- `npm run print-server-command` prints the local `llama-server` command for a downloaded model.
-- `npm run chat` runs one persistent chat turn with app-style context and memory.
-- `npm run memory-report` prints persistent chat and memory counts.
-- `npm run probe` runs image and no-image controls against a running llama-server.
-- `npm run report` prints the latest run verdict.
-- `npm run test` runs harness unit tests.
-- `npm run typecheck` validates the TypeScript package.
+```text
+npm run generate-fixtures
+npm run list-models
+npm run download-model -- --model <id>
+npm run download-embedding
+npm run chat -- --model <id> --server <url> --message <text>
+npm run memory-report
+npm run probe -- --model <id> --server <url>
+npm run report
+npm run typecheck
+npm run test
+```
