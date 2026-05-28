@@ -212,6 +212,15 @@ qwen2.5-vl-3b-vision
 
 Each probe runs four image tests and four no-image controls. Probe runs are memory-free and deterministic; they do not read chat history, profile, facts, or saved memories.
 
+### Inspect Raw LLM Probe Responses
+
+**Use this query to see the actual text returned by the LLM for image-input probe runs.** This is the source response saved in SQLite, not just the score or verdict that the probe report is based on.
+
+```powershell
+$q = "select datetime(created_at/1000, 'unixepoch') as created_at, test_id, score, response_text from probe_results where with_image = 1 order by created_at desc limit 20"
+node -e "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync('.data/vision-probe.db', { readOnly: true }); console.table(db.prepare(process.argv[1]).all()); db.close();" $q
+```
+
 The prompts are:
 
 ```text
