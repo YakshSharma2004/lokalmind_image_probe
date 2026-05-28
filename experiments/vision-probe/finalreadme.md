@@ -5,8 +5,9 @@ Desktop-only tool for testing local GGUF models with `llama.cpp` `llama-server`.
 It can:
 
 - download registered models
-- run a persistent chat with SQLite memory
-- run image probes to check whether a model actually understands image input
+- run chat with no saved memory by default
+- optionally run persistent chat with SQLite memory
+- run deterministic image probes to check whether a model actually understands image input
 - use a guided terminal wizard so you do not have to remember every command
 
 This does not change the production mobile app.
@@ -34,7 +35,7 @@ C:\Users\<your-user>\AppData\Local\Microsoft\WinGet\Packages\ggml.llamacpp_Micro
 Run everything from the experiment folder:
 
 ```powershell
-cd "C:\Users\ysharma1\OneDrive - Red Deer College\Documents\GitHub\lokalmind-app\experiments\vision-probe"
+cd "C:\Users\ysharma1\OneDrive - Red Deer College\Documents\GitHub\lokalmind_image_probe\experiments\vision-probe"
 npm install
 npm run generate-fixtures
 ```
@@ -75,7 +76,7 @@ Download a model:
 npm run download-model -- --model smolvlm-256m-vision
 ```
 
-Download the embedding model for semantic memory:
+Download the embedding model for optional semantic memory:
 
 ```powershell
 npm run download-embedding
@@ -128,21 +129,31 @@ For a vision model, include the projector:
   --port 8080
 ```
 
-## Run Persistent Chat
+## Run Chat
 
-Start a model server first, then run chat:
-
-```powershell
-npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --no-embeddings --message "Hello"
-```
-
-With embeddings:
+Start a model server first, then run chat. By default, chat does not read saved history, profile, facts, or memories:
 
 ```powershell
-npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --embedding-server http://127.0.0.1:8081 --message "My name is Yaksh."
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --message "Hello"
 ```
 
-Memory data is stored in SQLite:
+Chat generation uses `CHAT_MAX_TOKENS` when `--max-tokens` is not passed. The default is `512`.
+
+Use saved memory with score fallback:
+
+```powershell
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --with-memory --no-embeddings --message "what is my name"
+```
+
+Use saved memory with semantic embeddings:
+
+```powershell
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --with-memory --embedding-server http://127.0.0.1:8081 --message "My name is Yaksh."
+```
+
+Chat messages are stored in SQLite. Profile, summaries, and memories are only read and maintained when `--with-memory` is enabled.
+
+`--no-embeddings` does not mean no memory. It only means `--with-memory` should use score fallback instead of semantic embedding retrieval.
 
 ```text
 .data/vision-probe.db
@@ -157,7 +168,7 @@ npm run memory-report
 Debug a blank or strange response:
 
 ```powershell
-npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --no-embeddings --message "what is my name" --max-tokens 2048 --debug
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --with-memory --no-embeddings --message "what is my name" --max-tokens 2048 --debug
 ```
 
 ## Run Image Probe
@@ -169,7 +180,7 @@ npm run probe -- --model smolvlm-256m-vision --server http://127.0.0.1:8080
 npm run report
 ```
 
-The probe sends four generated PNG images and four no-image controls. A model only looks vision-capable if image results beat the no-image controls.
+The probe sends four generated PNG images and four no-image controls. A model only looks vision-capable if image results beat the no-image controls. Probe runs are memory-free and deterministic.
 
 Probe prompts:
 

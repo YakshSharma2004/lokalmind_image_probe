@@ -1,6 +1,7 @@
 import { access } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import {
   defaultDbPath,
   defaultFixtureDir,
@@ -8,6 +9,7 @@ import {
   defaultSettingsPath,
   modelCandidates,
   persistentChatSessionId,
+  resolveChatMaxTokens,
 } from './config.js';
 import { LlamaServerVisionAdapter } from './adapters/LlamaServerVisionAdapter.js';
 import { LlamaServerEmbeddingAdapter } from './adapters/LlamaServerEmbeddingAdapter.js';
@@ -47,7 +49,7 @@ import { scoreVisionAnswer } from './domain/scoreVisionAnswer.js';
 import { testCases } from './domain/testCases.js';
 import type { ChatMode, DownloadedModelState, ModelArtifact, ProbeResultRecord, ProbeRun, TestCase } from './types.js';
 
-interface ParsedArgs {
+export interface ParsedArgs {
   command:
     | 'probe'
     | 'report'
@@ -72,6 +74,7 @@ interface ParsedArgs {
   autoServer?: boolean;
   autoEmbeddingServer?: boolean;
   noEmbeddings?: boolean;
+  withMemory?: boolean;
   llamaServerBin?: string;
   port?: number;
   embeddingPort?: number;
@@ -163,6 +166,9 @@ function parseArgs(argv: string[]): ParsedArgs {
       case '--no-embeddings':
         args.noEmbeddings = true;
         break;
+      case '--with-memory':
+        args.withMemory = true;
+        break;
       case '--llama-server-bin':
         if (!next) throw new Error('--llama-server-bin requires a value');
         args.llamaServerBin = next;
@@ -209,6 +215,22 @@ function parseArgs(argv: string[]): ParsedArgs {
   return args;
 }
 
+export function validateChatArgs(args: ParsedArgs): void {
+  if (!args.model) throw new Error('--model is required');
+  if (!args.message) throw new Error('--message is required');
+  if (!args.server && !args.autoServer) throw new Error('chat requires either --server <url> or --auto-server');
+  if (args.server && args.autoServer) throw new Error('Use either --server or --auto-server, not both.');
+  if (args.embeddingServer && args.autoEmbeddingServer) {
+    throw new Error('Use either --embedding-server or --auto-embedding-server, not both.');
+  }
+  if (!args.withMemory && (args.embeddingServer || args.autoEmbeddingServer || args.noEmbeddings)) {
+    throw new Error('Memory is disabled by default. Use --with-memory before passing embedding options.');
+  }
+  if (args.withMemory && args.noEmbeddings && (args.embeddingServer || args.autoEmbeddingServer)) {
+    throw new Error('Use either --no-embeddings or an embedding server option, not both.');
+  }
+}
+
 function printHelp(): void {
   console.log(`LokalMind Vision Probe
 
@@ -228,17 +250,18 @@ Options:
   --mode <mode>           general | coding | creative | marketing. Default: general
   --fixtures <path>        Fixture directory. Default: .data/fixtures
   --temperature <number>   Default: 0
-  --max-tokens <number>    Default: 128
+  --max-tokens <number>    Chat default: CHAT_MAX_TOKENS or 512. Probe default: 128
   --timeout-ms <number>    Default: 120000
   --server-command <text>  Optional command used to start llama-server
   --auto-server            Spawn llama-server from downloaded model files
   --llama-server-bin <bin> Default: llama-server
   --port <number>          Default: auto-pick a free local port
-  --embedding-server <url> Use an existing embedding llama-server
-  --auto-embedding-server  Spawn embedding llama-server from downloaded MiniLM
+  --with-memory           Include saved chat history, profile, summaries, and memories. Default: off
+  --embedding-server <url> Use an existing embedding llama-server with --with-memory
+  --auto-embedding-server  Spawn embedding llama-server from downloaded MiniLM with --with-memory
   --embedding-port <num>   Default: auto-pick a free local port
   --embedding-pooling <p>  mean | cls. Default: mean
-  --no-embeddings          Force score-based memory retrieval
+  --no-embeddings          With --with-memory, use score fallback instead of semantic embeddings
   --context-size <number>  Default: model registry value or 8192
   --keep-server-alive      Leave spawned llama-server running after probe
   --with-app-context       Reserved for a follow-up mode; v1 probes stay deterministic
@@ -652,16 +675,10 @@ async function runPrintServerCommand(args: ParsedArgs): Promise<number> {
 }
 
 async function runChat(args: ParsedArgs): Promise<number> {
-  if (!args.model) throw new Error('--model is required');
-  if (!args.message) throw new Error('--message is required');
-  if (!args.server && !args.autoServer) throw new Error('chat requires either --server <url> or --auto-server');
-  if (args.server && args.autoServer) throw new Error('Use either --server or --auto-server, not both.');
-  if (args.embeddingServer && args.autoEmbeddingServer) {
-    throw new Error('Use either --embedding-server or --auto-embedding-server, not both.');
-  }
-  if (args.noEmbeddings && (args.embeddingServer || args.autoEmbeddingServer)) {
-    throw new Error('Use either --no-embeddings or an embedding server option, not both.');
-  }
+  validateChatArgs(args);
+  const modelId = args.model;
+  const message = args.message;
+  if (!modelId || !message) throw new Error('chat requires --model and --message');
 
   const kv = new NodeKVStorage(defaultSettingsPath);
   const settings = await kv.read();
@@ -674,13 +691,14 @@ async function runChat(args: ParsedArgs): Promise<number> {
 
   try {
     debugLog?.(
-      `[chat-cli] start model=${args.model} mode=${args.mode ?? 'general'} ` +
+      `[chat-cli] start model=${modelId} mode=${args.mode ?? 'general'} ` +
+      `memory=${Boolean(args.withMemory)} ` +
       `auto_server=${Boolean(args.autoServer)} server=${args.server ?? '(auto)'} ` +
       `auto_embedding=${Boolean(args.autoEmbeddingServer)} embedding_server=${args.embeddingServer ?? '(none)'}`,
     );
     if (args.autoServer) {
-      const artifact = getModelArtifact(args.model);
-      const downloaded = resolveDownloadedModel(settings, args.model);
+      const artifact = getModelArtifact(modelId);
+      const downloaded = resolveDownloadedModel(settings, modelId);
       await verifyDownloadedFiles(artifact, downloaded);
       const port = args.port ?? await getFreePort();
       debugLog?.(
@@ -698,7 +716,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
       debugLog?.(`[chat-cli] llama-server ready at ${serverUrl}`);
     }
 
-    if (args.autoEmbeddingServer) {
+    if (args.withMemory && args.autoEmbeddingServer) {
       const downloadedEmbedding = resolveDownloadedEmbedding(settings);
       await verifyDownloadedFiles(embeddingArtifact, downloadedEmbedding);
       const port = args.embeddingPort ?? await getFreePort();
@@ -719,7 +737,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
 
     await kv.merge({
       serverUrl,
-      lastModelId: args.model,
+      lastModelId: modelId,
     });
 
     const repositories = await createPersistentRepositories();
@@ -727,7 +745,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
     const appSettingsRepository = new DesktopAppSettingsRepository(kv);
     const memoryService = new DesktopMemoryService(repositories.memoryRepository);
 
-    if (!args.noEmbeddings && embeddingServerUrl) {
+    if (args.withMemory && !args.noEmbeddings && embeddingServerUrl) {
       const embeddingAdapter = new LlamaServerEmbeddingAdapter(embeddingServerUrl);
       await embeddingAdapter.initialize();
       memoryService.setEmbeddingService(embeddingAdapter);
@@ -744,23 +762,29 @@ async function runChat(args: ParsedArgs): Promise<number> {
       appSettingsRepository,
       memoryService,
       llmAdapter,
-      modelId: args.model,
-      message: args.message,
+      modelId,
+      message,
       mode: args.mode ?? 'general',
       temperature: args.temperature ?? 0.7,
-      maxTokens: args.maxTokens ?? 1024,
+      maxTokens: resolveChatMaxTokens(args.maxTokens),
       timeoutMs: args.timeoutMs ?? defaultProbeConfig.timeoutMs,
+      memoryEnabled: Boolean(args.withMemory),
       debugLog,
     });
 
-    console.log(`Model: ${args.model} (${modelLabelFor(args.model)})`);
+    console.log(`Model: ${modelId} (${modelLabelFor(modelId)})`);
     console.log(`Server: ${serverUrl}`);
     if (managedChatServer) console.log(`Command: ${managedChatServer.command}`);
-    if (embeddingServerUrl) {
-      console.log(`Embeddings: ${embeddingServerUrl}`);
-      if (managedEmbeddingServer) console.log(`Embedding command: ${managedEmbeddingServer.command}`);
+    console.log(`Memory: ${args.withMemory ? 'enabled' : 'disabled'}`);
+    if (args.withMemory) {
+      if (embeddingServerUrl) {
+        console.log(`Embeddings: ${embeddingServerUrl}`);
+        if (managedEmbeddingServer) console.log(`Embedding command: ${managedEmbeddingServer.command}`);
+      } else {
+        console.log('Embeddings: score fallback');
+      }
     } else {
-      console.log('Embeddings: score fallback');
+      console.log('Embeddings: disabled');
     }
     console.log(`Context messages: ${result.contextMessageCount}`);
     console.log(`Relevant memories: ${result.relevantMemoryCount}`);
@@ -895,7 +919,13 @@ async function main(): Promise<void> {
   process.exitCode = code;
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+function isCliEntryPoint(): boolean {
+  return process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
+}
+
+if (isCliEntryPoint()) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}

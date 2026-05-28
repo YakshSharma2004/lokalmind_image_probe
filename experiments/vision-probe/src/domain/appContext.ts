@@ -131,7 +131,7 @@ Final answer requirement: give the final answer directly and concisely. Do not s
 
   let inSessionBudgetLeft = BUDGET_IN_SESSION;
   const includedSummaries: SessionSummary[] = [];
-  for (const summary of [...inSessionSummaries].sort((a, b) => a.bucketIndex - b.bucketIndex)) {
+  for (const summary of [...inSessionSummaries].sort((a, b) => b.bucketIndex - a.bucketIndex)) {
     const tokens = estimateTokens(summary.summary);
     if (inSessionBudgetLeft >= tokens) {
       includedSummaries.push(summary);
@@ -181,7 +181,11 @@ ${profile}`,
   }
 
   if (includedSummaries.length > 0) {
-    systemParts.push(`\n[Earlier in this conversation]\n${includedSummaries.map((s) => s.summary).join('\n\n')}`);
+    const block = includedSummaries
+      .sort((a, b) => a.bucketIndex - b.bucketIndex)
+      .map((s) => s.summary)
+      .join('\n\n');
+    systemParts.push(`\n[Earlier in this conversation]\n${block}`);
   }
 
   const systemContent = systemParts.join('');

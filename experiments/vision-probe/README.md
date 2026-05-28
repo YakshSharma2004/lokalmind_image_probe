@@ -4,8 +4,8 @@ Desktop experiment for running local GGUF models through `llama.cpp` `llama-serv
 
 It supports two workflows:
 
-- Persistent chat with app-style memory stored in SQLite.
-- Image probes that test whether a model can process real image input.
+- Chat that defaults to no saved memory, with optional app-style memory stored in SQLite.
+- Deterministic image probes that test whether a model can process real image input.
 
 This does not change the production mobile app.
 
@@ -40,7 +40,7 @@ $llama = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Wi
 Run commands from the experiment root, not from `src`.
 
 ```powershell
-cd "C:\Users\ysharma1\OneDrive - Red Deer College\Documents\GitHub\lokalmind-app\experiments\vision-probe"
+cd "C:\Users\ysharma1\OneDrive - Red Deer College\Documents\GitHub\lokalmind_image_probe\experiments\vision-probe"
 npm install
 npm run generate-fixtures
 ```
@@ -56,7 +56,7 @@ The wizard can download models, configure `llama-server.exe`, run chat, run imag
 Always pass CLI flags after `--`:
 
 ```powershell
-npm run chat -- --model qwen3.5-0.8b --message "Hello"
+npm run chat -- --model qwen3.5-0.8b --auto-server --message "Hello"
 ```
 
 ## Download Models
@@ -94,7 +94,7 @@ Download a model:
 npm run download-model -- --model deepseek-r1-1.5b
 ```
 
-Download the embedding model used for semantic memory:
+Download the embedding model used for optional semantic memory:
 
 ```powershell
 npm run download-embedding
@@ -147,18 +147,26 @@ For the Gemma vision model, start a separate server:
 & $llama -m ".\.data\models\gemma3-4b-vision\gemma-3-4b-it-Q4_K_M.gguf" --mmproj ".\.data\models\gemma3-4b-vision\mmproj-model-f16.gguf" -c 8192 --host 127.0.0.1 --port 8082
 ```
 
-## Run Persistent Chat
+## Run Chat
 
-Run chat in another terminal:
+Run chat in another terminal. By default, chat does not read saved history, profile, facts, or memories:
 
 ```powershell
-npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --embedding-server http://127.0.0.1:8081 --message "My name is Yaksh and I am testing local model memory."
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --message "Hello"
 ```
 
-Without embeddings:
+Chat generation uses `CHAT_MAX_TOKENS` when `--max-tokens` is not passed. The default is `512`.
+
+Use saved memory with score fallback:
 
 ```powershell
-npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --no-embeddings --message "Hello"
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --with-memory --no-embeddings --message "what is my name"
+```
+
+Use saved memory with semantic embeddings:
+
+```powershell
+npm run chat -- --model deepseek-r1-1.5b --server http://127.0.0.1:8080 --with-memory --embedding-server http://127.0.0.1:8081 --message "My name is Yaksh."
 ```
 
 Check stored chat and memory:
@@ -167,11 +175,13 @@ Check stored chat and memory:
 npm run memory-report
 ```
 
-The chat flow stores:
+The chat flow always stores raw chat messages. When `--with-memory` is enabled, it can also read and maintain profile, summaries, and memory checkpoints.
+
+`--no-embeddings` does not mean no memory. It only means `--with-memory` should use score fallback instead of semantic embedding retrieval.
 
 ```text
 chat_messages              raw persistent chat history
-session_summaries          rolling 20-message summaries
+session_summaries          rolling chat summaries
 session_memories           memory checkpoints
 session_memories.embedding semantic vectors for memory retrieval
 ```
@@ -200,7 +210,7 @@ smolvlm2-2.2b-vision
 qwen2.5-vl-3b-vision
 ```
 
-Each probe runs four image tests and four no-image controls.
+Each probe runs four image tests and four no-image controls. Probe runs are memory-free and deterministic; they do not read chat history, profile, facts, or saved memories.
 
 The prompts are:
 
@@ -229,7 +239,8 @@ You are a precise visual inspection assistant. Answer only from the provided ima
 If Node can spawn child processes on your machine, you can use auto server mode:
 
 ```powershell
-npm run chat -- --model deepseek-r1-1.5b --auto-server --auto-embedding-server --message "Hello"
+npm run chat -- --model deepseek-r1-1.5b --auto-server --message "Hello"
+npm run chat -- --model deepseek-r1-1.5b --auto-server --with-memory --auto-embedding-server --message "Hello"
 ```
 
 ```powershell
@@ -303,6 +314,7 @@ npm run list-models
 npm run download-model -- --model <id>
 npm run download-embedding
 npm run chat -- --model <id> --server <url> --message <text>
+npm run chat -- --model <id> --server <url> --with-memory --no-embeddings --message <text>
 npm run memory-report
 npm run probe -- --model <id> --server <url>
 npm run report

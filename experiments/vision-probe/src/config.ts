@@ -20,6 +20,16 @@ export const defaultProbeConfig = {
   timeoutMs: 120_000,
 } as const;
 
+const DEFAULT_CHAT_MAX_TOKENS = 512;
+
+export function resolveChatMaxTokens(override?: number): number {
+  if (override !== undefined) return override;
+  const raw = process.env.CHAT_MAX_TOKENS?.trim();
+  if (!raw) return DEFAULT_CHAT_MAX_TOKENS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_CHAT_MAX_TOKENS;
+}
+
 export const modelCandidates: Record<string, { label: string; notes: string }> = {
   'gemma3-4b-vision': {
     label: 'ggml-org/gemma-3-4b-it-GGUF',

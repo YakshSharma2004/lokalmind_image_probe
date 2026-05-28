@@ -89,7 +89,7 @@ async function printMenu() {
   console.log('2. List all registered models');
   console.log('3. Download a model');
   console.log('4. Download embedding model');
-  console.log('5. Chat with a model');
+  console.log('5. Chat with a model (memory off by default)');
   console.log('6. Probe a model for image compatibility');
   console.log('7. Memory report');
   console.log('8. Latest probe report');
@@ -157,17 +157,17 @@ async function chatWithModel() {
     return;
   }
 
-  const settings = await readSettings();
-  const hasEmbedding = await isEmbeddingReady(settings);
-  let useEmbeddings = hasEmbedding;
+  const useMemory = isYes(await ask('Use saved memory/profile/history? (y/N): '));
+  let useEmbeddings = false;
 
-  if (!hasEmbedding) {
-    const answer = await ask('Embedding model is missing. Continue with score fallback memory? (y/N): ');
-    if (!isYes(answer)) {
-      console.log('Chat cancelled. Run option 4 to download the embedding model.');
-      return;
+  if (useMemory) {
+    const settings = await readSettings();
+    const hasEmbedding = await isEmbeddingReady(settings);
+    if (hasEmbedding) {
+      useEmbeddings = isYes(await ask('Use semantic embeddings for memory? (y/N): '));
+    } else {
+      console.log('Embedding model is missing. Memory will use score fallback.');
     }
-    useEmbeddings = false;
   }
 
   const args = [
@@ -183,11 +183,14 @@ async function chatWithModel() {
     message,
     '--debug',
   ];
-  args.push(useEmbeddings ? '--auto-embedding-server' : '--no-embeddings');
+  if (useMemory) {
+    args.push('--with-memory');
+    args.push(useEmbeddings ? '--auto-embedding-server' : '--no-embeddings');
+  }
 
   const result = await runNpm(args);
   if (result.code !== 0 && isSpawnFailure(result)) {
-    await printManualChatFallback(selected.id, message, useEmbeddings);
+    await printManualChatFallback(selected.id, message, useMemory, useEmbeddings);
   }
 }
 
@@ -254,7 +257,7 @@ async function selectDownloadedModel() {
   return selected;
 }
 
-async function printManualChatFallback(modelId, message, useEmbeddings) {
+async function printManualChatFallback(modelId, message, useMemory, useEmbeddings) {
   console.log('');
   console.log('Auto server mode failed. Start llama-server manually, then run chat with --server.');
   console.log('');
@@ -262,7 +265,7 @@ async function printManualChatFallback(modelId, message, useEmbeddings) {
   const command = await getModelServerCommand(modelId, 8080);
   if (command) console.log(command);
 
-  if (useEmbeddings) {
+  if (useMemory && useEmbeddings) {
     const settings = await readSettings();
     const embeddingPath = settings.downloadedEmbeddingModel?.modelPath;
     if (embeddingPath) {
@@ -274,7 +277,7 @@ async function printManualChatFallback(modelId, message, useEmbeddings) {
       console.log('');
       console.log('Terminal 3:');
       console.log(
-        `npm run chat -- --model ${modelId} --server http://127.0.0.1:8080 --embedding-server http://127.0.0.1:8081 --message ${quotePowerShell(message)}`,
+        `npm run chat -- --model ${modelId} --server http://127.0.0.1:8080 --with-memory --embedding-server http://127.0.0.1:8081 --message ${quotePowerShell(message)}`,
       );
       return;
     }
@@ -282,9 +285,8 @@ async function printManualChatFallback(modelId, message, useEmbeddings) {
 
   console.log('');
   console.log('Terminal 2:');
-  console.log(
-    `npm run chat -- --model ${modelId} --server http://127.0.0.1:8080 --no-embeddings --message ${quotePowerShell(message)}`,
-  );
+  const memoryArgs = useMemory ? ' --with-memory --no-embeddings' : '';
+  console.log(`npm run chat -- --model ${modelId} --server http://127.0.0.1:8080${memoryArgs} --message ${quotePowerShell(message)}`);
 }
 
 async function printManualProbeFallback(modelId) {

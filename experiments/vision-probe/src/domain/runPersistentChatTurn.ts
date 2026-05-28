@@ -21,6 +21,7 @@ export interface RunPersistentChatTurnParams {
   temperature: number;
   maxTokens: number;
   timeoutMs: number;
+  memoryEnabled: boolean;
   debugLog?: ((message: string) => void) | undefined;
 }
 
@@ -36,8 +37,14 @@ export interface PersistentChatTurnResult {
 }
 
 export async function runPersistentChatTurn(params: RunPersistentChatTurnParams): Promise<PersistentChatTurnResult> {
-  const history = await params.chatRepository.getMessages(persistentChatSessionId);
-  params.debugLog?.(`[chat] loaded history messages=${history.length}`);
+  const history = params.memoryEnabled
+    ? await params.chatRepository.getMessages(persistentChatSessionId)
+    : [];
+  params.debugLog?.(
+    params.memoryEnabled
+      ? `[chat] loaded history messages=${history.length}`
+      : '[chat] memory disabled; skipping history/profile/memory context',
+  );
   const now = Date.now();
   const userMessage: PersistentChatMessage = {
     id: `msg_${now}_${randomUUID()}_user`,
@@ -51,11 +58,17 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
   params.debugLog?.(`[chat] saved user message id=${userMessage.id} chars=${userMessage.content.length}`);
 
   const { historyOnly, currentMessage } = buildCappedLlmTurns(history, userMessage);
-  const modeOverride = await params.appSettingsRepository.getModeSystemPromptOverride(params.mode);
-  const pinnedFacts = await params.appSettingsRepository.getPinnedFacts();
-  const userProfile = await params.appSettingsRepository.getUserProfile();
-  const summaries = await params.memoryRepository.getSessionSummaries(persistentChatSessionId);
-  const memories = await params.memoryService.getRelevantMemories(userMessage.content, history.length);
+  const modeOverride = params.memoryEnabled
+    ? await params.appSettingsRepository.getModeSystemPromptOverride(params.mode)
+    : null;
+  const pinnedFacts = params.memoryEnabled ? await params.appSettingsRepository.getPinnedFacts() : '';
+  const userProfile = params.memoryEnabled ? await params.appSettingsRepository.getUserProfile() : '';
+  const summaries = params.memoryEnabled
+    ? await params.memoryRepository.getSessionSummaries(persistentChatSessionId)
+    : [];
+  const memories = params.memoryEnabled
+    ? await params.memoryService.getRelevantMemories(userMessage.content, history.length)
+    : [];
   const systemPrompt = resolveSystemPromptForChat(params.mode, modeOverride);
   params.debugLog?.(
     `[chat] context inputs mode=${params.mode} history_included=${historyOnly.length} ` +
@@ -128,17 +141,21 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     throw new Error(assistantText || 'LLM generation failed');
   }
 
-  params.debugLog?.('[chat] running memory maintenance if needed');
-  await maybeRunMemoryMaintenance({
-    chatRepository: params.chatRepository,
-    memoryRepository: params.memoryRepository,
-    memoryService: params.memoryService,
-    appSettingsRepository: params.appSettingsRepository,
-    llmAdapter: params.llmAdapter,
-    modelId: params.modelId,
-    timeoutMs: params.timeoutMs,
-  });
-  params.debugLog?.('[chat] memory maintenance completed');
+  if (params.memoryEnabled) {
+    params.debugLog?.('[chat] running memory maintenance if needed');
+    await maybeRunMemoryMaintenance({
+      chatRepository: params.chatRepository,
+      memoryRepository: params.memoryRepository,
+      memoryService: params.memoryService,
+      appSettingsRepository: params.appSettingsRepository,
+      llmAdapter: params.llmAdapter,
+      modelId: params.modelId,
+      timeoutMs: params.timeoutMs,
+    });
+    params.debugLog?.('[chat] memory maintenance completed');
+  } else {
+    params.debugLog?.('[chat] memory maintenance skipped');
+  }
 
   return {
     userMessage,

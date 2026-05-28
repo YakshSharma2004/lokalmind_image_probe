@@ -14,7 +14,12 @@ interface ParsedSummary {
 }
 
 const PROFILE_MAX_CHARS = 600;
-const SUMMARY_BUCKET_SIZE = 20;
+const SUMMARY_BUCKET_SIZE = 10;
+const USER_FACTS_LABEL_REGEX = /\bUser-stated facts:\s*/gi;
+const DURABLE_PROFILE_FACT_REGEX =
+  /\b(i prefer|i like|i use|i work as|i live in|i am a|i am an|i'm a|i'm an|my role|my job|my preference|my preferences|my company|my location)\b/i;
+const TEMPORARY_PROFILE_FACT_REGEX =
+  /\b(testing|trying|debugging|running|working on|for now|currently|local model memory)\b/i;
 
 const summarizePrompt = (conversation: string) => `Read this conversation and fill in these fields. Write each field on its own line. No extra text.
 
@@ -160,10 +165,15 @@ async function maybeUpdateUserProfile(params: {
     .map((message) => message.content.trim());
   if (!userMessages.some((content) => hasMeaningfulProfileStatement(content))) return;
 
-  const currentProfile = await params.appSettingsRepository.getUserProfile();
+  const rawCurrentProfile = await params.appSettingsRepository.getUserProfile();
+  const currentProfile = sanitizeUserProfile(rawCurrentProfile);
   const deterministicProfile = buildDeterministicProfile(currentProfile, userMessages);
   if (deterministicProfile && deterministicProfile !== currentProfile) {
     await params.appSettingsRepository.saveUserProfile(deterministicProfile);
+    return;
+  }
+  if (currentProfile !== rawCurrentProfile) {
+    await params.appSettingsRepository.saveUserProfile(currentProfile);
     return;
   }
 
@@ -172,7 +182,7 @@ async function maybeUpdateUserProfile(params: {
     [{ role: 'user', content: profileUpdatePrompt(currentProfile, conversation) }],
     { model: params.modelId, temperature: 0.2, maxTokens: 150, timeoutMs: params.timeoutMs },
   );
-  const updated = response.text.trim().slice(0, PROFILE_MAX_CHARS);
+  const updated = sanitizeUserProfile(response.text).slice(0, PROFILE_MAX_CHARS);
   if (!updated || updated === currentProfile) return;
   if (currentProfile && updated.length < currentProfile.length * 0.8) return;
   await params.appSettingsRepository.saveUserProfile(updated);
@@ -268,13 +278,14 @@ const NAME_FROM_MY_NAME_IS = /\bmy name is\s+([a-z][a-z'-]{1,30}(?:\s+[a-z][a-z'
 const NAME_FROM_I_AM_STRICT = /^\s*i am\s+([a-z][a-z'-]{1,30}(?:\s+[a-z][a-z'-]{1,30}){0,1})\s*[.!]?\s*$/i;
 const NAME_FROM_IM_STRICT = /^\s*i'm\s+([a-z][a-z'-]{1,30}(?:\s+[a-z][a-z'-]{1,30}){0,1})\s*[.!]?\s*$/i;
 
-function buildDeterministicProfile(currentProfile: string, userMessages: string[]): string | null {
-  const existingName = extractCurrentProfileName(currentProfile);
+export function buildDeterministicProfile(currentProfile: string, userMessages: string[]): string | null {
+  const sanitizedCurrentProfile = sanitizeUserProfile(currentProfile);
+  const existingName = extractCurrentProfileName(sanitizedCurrentProfile);
   let name: string | null = existingName;
   const factSet = new Map<string, string>();
 
-  for (const fact of extractProfileFacts(currentProfile)) {
-    factSet.set(fact.toLowerCase(), fact.endsWith('.') ? fact : `${fact}.`);
+  for (const fact of extractProfileFacts(sanitizedCurrentProfile)) {
+    addProfileFact(factSet, fact);
   }
 
   for (const raw of userMessages) {
@@ -282,20 +293,7 @@ function buildDeterministicProfile(currentProfile: string, userMessages: string[
     if (!text || isSmallTalk(text) || isQuestionOnly(text) || startsLikeQuestion(text)) continue;
     const maybeName = extractNameFromText(text);
     if (maybeName) name = maybeName;
-    if (text.length < 10) continue;
-
-    const facts = text
-      .split(/[.!\n]/)
-      .map((value) => normalizeText(value))
-      .filter((value) => value.length >= 10)
-      .filter((value) => !value.endsWith('?'))
-      .filter((value) => !startsLikeQuestion(value))
-      .slice(0, 2);
-
-    for (const fact of facts) {
-      const key = fact.toLowerCase();
-      if (!factSet.has(key)) factSet.set(key, fact.endsWith('.') ? fact : `${fact}.`);
-    }
+    extractDurableProfileFacts(text).forEach((fact) => addProfileFact(factSet, fact));
   }
 
   if (!name && factSet.size === 0) return null;
@@ -303,7 +301,52 @@ function buildDeterministicProfile(currentProfile: string, userMessages: string[
   if (name) pieces.push(`The person you are talking to is named ${name}.`);
   const facts = Array.from(factSet.values()).slice(0, 6);
   if (facts.length > 0) pieces.push(`User-stated facts: ${facts.join(' ')}`);
+  return sanitizeUserProfile(pieces.join(' ')).slice(0, PROFILE_MAX_CHARS);
+}
+
+export function sanitizeUserProfile(profile: string): string {
+  const cleaned = normalizeText(profile.replace(USER_FACTS_LABEL_REGEX, ''));
+  if (!cleaned) return '';
+
+  const name = extractCurrentProfileName(cleaned) ?? extractNameFromText(cleaned);
+  const factSet = new Map<string, string>();
+  for (const fact of extractProfileFacts(cleaned)) {
+    addProfileFact(factSet, fact);
+  }
+
+  const pieces: string[] = [];
+  if (name) pieces.push(`The person you are talking to is named ${name}.`);
+  const facts = Array.from(factSet.values()).slice(0, 6);
+  if (facts.length > 0) pieces.push(`User-stated facts: ${facts.join(' ')}`);
   return normalizeText(pieces.join(' ')).slice(0, PROFILE_MAX_CHARS);
+}
+
+function extractDurableProfileFacts(text: string): string[] {
+  return text
+    .split(/[.!\n]/)
+    .map((value) => normalizeText(value))
+    .filter((value) => value.length >= 10)
+    .filter((value) => !value.endsWith('?'))
+    .filter((value) => !startsLikeQuestion(value))
+    .filter((value) => !extractNameFromText(value))
+    .filter(isDurableProfileFact)
+    .slice(0, 2);
+}
+
+function addProfileFact(factSet: Map<string, string>, fact: string): void {
+  const normalized = normalizeText(fact.replace(USER_FACTS_LABEL_REGEX, ''));
+  if (!isDurableProfileFact(normalized)) return;
+  const withPeriod = normalized.endsWith('.') ? normalized : `${normalized}.`;
+  const key = withPeriod.toLowerCase();
+  if (!factSet.has(key)) factSet.set(key, withPeriod);
+}
+
+function isDurableProfileFact(value: string): boolean {
+  const text = normalizeText(value.replace(USER_FACTS_LABEL_REGEX, ''));
+  if (text.length < 10) return false;
+  if (extractNameFromText(text)) return false;
+  if (TEMPORARY_PROFILE_FACT_REGEX.test(text)) return false;
+  return DURABLE_PROFILE_FACT_REGEX.test(text);
 }
 
 function isQuestionOnly(text: string): boolean {
@@ -343,6 +386,7 @@ function extractCurrentProfileName(profile: string): string | null {
 
 function extractProfileFacts(profile: string): string[] {
   return profile
+    .replace(USER_FACTS_LABEL_REGEX, '')
     .split(/[.]\s+/)
     .map((value) => normalizeText(value))
     .filter((value) => value.length > 0)

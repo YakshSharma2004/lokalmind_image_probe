@@ -6,12 +6,21 @@ import { imagePathToDataUrl, LlamaServerVisionAdapter } from './adapters/LlamaSe
 import { buildLlamaServerArgs } from './adapters/ManagedLlamaServer.js';
 import { NodeDownloadService } from './adapters/NodeDownloadService.js';
 import { NodeSQLiteDriver } from './adapters/NodeSQLiteDriver.js';
+import { validateChatArgs } from './cli.js';
+import { resolveChatMaxTokens } from './config.js';
+import type { DesktopAppSettingsRepository } from './data/DesktopAppSettingsRepository.js';
+import type { DesktopMemoryRepository } from './data/DesktopMemoryRepository.js';
+import type { PersistentChatRepository } from './data/PersistentChatRepository.js';
 import { initializeSchema } from './data/schema.js';
 import { VisionProbeRepository } from './data/VisionProbeRepository.js';
+import { buildContextMessages } from './domain/appContext.js';
 import { getModelArtifact, resolveModelUrl } from './domain/modelArtifacts.js';
+import { buildDeterministicProfile, sanitizeUserProfile } from './domain/persistentMemoryMaintenance.js';
+import { runPersistentChatTurn } from './domain/runPersistentChatTurn.js';
 import { computeVisionVerdict, scoreVisionAnswer } from './domain/scoreVisionAnswer.js';
 import { testCases } from './domain/testCases.js';
 import { generateFixtures } from './fixtures/generateFixtures.js';
+import type { PersistentChatMessage, ProbeMessage, SessionMemory, SessionSummary } from './types.js';
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), 'lokalmind-vision-probe-'));
@@ -255,6 +264,265 @@ async function testModelRegistryAndServerCommand(): Promise<void> {
   ]);
 }
 
+async function testChatMaxTokensEnvDefault(): Promise<void> {
+  const previous = process.env.CHAT_MAX_TOKENS;
+  try {
+    delete process.env.CHAT_MAX_TOKENS;
+    assert.equal(resolveChatMaxTokens(), 512);
+    process.env.CHAT_MAX_TOKENS = '2048';
+    assert.equal(resolveChatMaxTokens(), 2048);
+    process.env.CHAT_MAX_TOKENS = 'not-a-number';
+    assert.equal(resolveChatMaxTokens(), 512);
+    assert.equal(resolveChatMaxTokens(99), 99);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CHAT_MAX_TOKENS;
+    } else {
+      process.env.CHAT_MAX_TOKENS = previous;
+    }
+  }
+}
+
+async function testContextBudgetKeepsNewestSummaries(): Promise<void> {
+  const oldSummary: SessionSummary = {
+    id: 'old',
+    sessionId: 'persistent_chat',
+    bucketIndex: 0,
+    summary: `old summary ${'x'.repeat(560)}`,
+    turnStart: 1,
+    turnEnd: 10,
+    createdAt: 1,
+  };
+  const newSummary: SessionSummary = {
+    id: 'new',
+    sessionId: 'persistent_chat',
+    bucketIndex: 1,
+    summary: `new summary ${'y'.repeat(560)}`,
+    turnStart: 11,
+    turnEnd: 20,
+    createdAt: 2,
+  };
+
+  const messages = buildContextMessages({
+    systemPrompt: 'System prompt.',
+    pinnedFacts: '',
+    userProfile: '',
+    crossSessionMemories: [],
+    inSessionSummaries: [oldSummary, newSummary],
+    history: [],
+    currentMessage: { role: 'user', content: 'Hello' },
+  });
+
+  const system = messages[0]?.content ?? '';
+  assert.match(system, /new summary/);
+  assert.doesNotMatch(system, /old summary/);
+}
+
+async function testChatDefaultsToNoMemoryContext(): Promise<void> {
+  const saved: PersistentChatMessage[] = [];
+  let capturedMessages: ProbeMessage[] = [];
+  const chatRepository = {
+    async getMessages() {
+      throw new Error('history should not be read when memory is disabled');
+    },
+    async saveMessage(message: PersistentChatMessage) {
+      saved.push(message);
+    },
+  } as unknown as PersistentChatRepository;
+  const appSettingsRepository = throwingSettingsRepository();
+  const memoryRepository = throwingMemoryRepository();
+  const memoryService = {
+    async getRelevantMemories() {
+      throw new Error('memories should not be read when memory is disabled');
+    },
+  };
+  const llmAdapter = {
+    async generateResponse(messages: ProbeMessage[]) {
+      capturedMessages = messages;
+      return { text: 'ok', latencyMs: 1 };
+    },
+  } as unknown as LlamaServerVisionAdapter;
+
+  const result = await runPersistentChatTurn({
+    chatRepository,
+    memoryRepository,
+    appSettingsRepository,
+    memoryService: memoryService as never,
+    llmAdapter,
+    modelId: 'test-model',
+    message: 'Only use this turn.',
+    mode: 'general',
+    temperature: 0,
+    maxTokens: 16,
+    timeoutMs: 1000,
+    memoryEnabled: false,
+  });
+
+  assert.equal(saved.length, 2);
+  assert.equal(result.relevantMemoryCount, 0);
+  assert.equal(result.summaryCount, 0);
+  assert.equal(capturedMessages.length, 2);
+  assert.equal(capturedMessages[0]?.role, 'system');
+  assert.equal(capturedMessages[1]?.role, 'user');
+  assert.equal(capturedMessages[1]?.content, 'Only use this turn.');
+  assert.doesNotMatch(capturedMessages[0]?.content ?? '', /Human profile|Past conversations|Earlier in this conversation/);
+}
+
+async function testChatWithMemoryIncludesMemoryContext(): Promise<void> {
+  const messages: PersistentChatMessage[] = [
+    {
+      id: 'history-1',
+      sessionId: 'persistent_chat',
+      role: 'user',
+      content: 'Earlier detail?',
+      status: 'done',
+      createdAt: 1,
+    },
+  ];
+  let capturedMessages: ProbeMessage[] = [];
+  const chatRepository = {
+    async getMessages() {
+      return messages;
+    },
+    async saveMessage(message: PersistentChatMessage) {
+      messages.push(message);
+    },
+  } as unknown as PersistentChatRepository;
+  const appSettingsRepository = {
+    async getModeSystemPromptOverride() {
+      return null;
+    },
+    async getPinnedFacts() {
+      return 'Pinned note.';
+    },
+    async getUserProfile() {
+      return 'The person you are talking to is named Yaksh.';
+    },
+    async saveUserProfile() {
+      throw new Error('profile should not be updated for question-only message');
+    },
+  } as unknown as DesktopAppSettingsRepository;
+  const memoryRepository = {
+    async getSessionSummaries() {
+      return [
+        {
+          id: 'summary-1',
+          sessionId: 'persistent_chat',
+          bucketIndex: 0,
+          summary: 'Earlier summary.',
+          turnStart: 1,
+          turnEnd: 2,
+          createdAt: 1,
+        },
+      ] as SessionSummary[];
+    },
+  } as unknown as DesktopMemoryRepository;
+  const memoryService = {
+    async getRelevantMemories() {
+      return [
+        {
+          id: 'memory-1',
+          sessionId: 'persistent_chat',
+          sessionTitle: 'Persistent Chat',
+          summary: 'Remembered detail.',
+          embedding: null,
+          score: 1,
+          isPinned: false,
+          isUserEdited: false,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ] as SessionMemory[];
+    },
+  };
+  const llmAdapter = {
+    async generateResponse(messagesForLlm: ProbeMessage[]) {
+      capturedMessages = messagesForLlm;
+      return { text: 'ok', latencyMs: 1 };
+    },
+  } as unknown as LlamaServerVisionAdapter;
+
+  const result = await runPersistentChatTurn({
+    chatRepository,
+    memoryRepository,
+    appSettingsRepository,
+    memoryService: memoryService as never,
+    llmAdapter,
+    modelId: 'test-model',
+    message: 'What did I say before?',
+    mode: 'general',
+    temperature: 0,
+    maxTokens: 16,
+    timeoutMs: 1000,
+    memoryEnabled: true,
+  });
+
+  const system = capturedMessages[0]?.content ?? '';
+  assert.equal(result.relevantMemoryCount, 1);
+  assert.equal(result.summaryCount, 1);
+  assert.match(system, /Pinned note/);
+  assert.match(system, /named Yaksh/);
+  assert.match(system, /Remembered detail/);
+  assert.match(system, /Earlier summary/);
+  assert.ok(capturedMessages.some((message) => message.content === 'Earlier detail?'));
+}
+
+async function testCliRejectsEmbeddingFlagsWithoutMemory(): Promise<void> {
+  assert.throws(
+    () => validateChatArgs({
+      command: 'chat',
+      model: 'test-model',
+      server: 'http://127.0.0.1:1',
+      message: 'hello',
+      noEmbeddings: true,
+    }),
+    /Memory is disabled by default/,
+  );
+}
+
+async function testProfileSanitizer(): Promise<void> {
+  const badProfile = [
+    'The person you are talking to is named Yaksh.',
+    'User-stated facts: User-stated facts: User-stated facts:',
+    'My name is Yaksh and I am testing local model memory.',
+    'My name is Yaksh and I am testing local model memory.',
+    'my name is yaksh.',
+  ].join(' ');
+  assert.equal(sanitizeUserProfile(badProfile), 'The person you are talking to is named Yaksh.');
+  assert.equal(
+    buildDeterministicProfile(badProfile, ['my name is yaksh.']),
+    'The person you are talking to is named Yaksh.',
+  );
+  assert.equal(
+    sanitizeUserProfile(
+      'The person you are talking to is named Yaksh. User-stated facts: I prefer concise answers. User-stated facts: I prefer concise answers.',
+    ),
+    'The person you are talking to is named Yaksh. User-stated facts: I prefer concise answers.',
+  );
+}
+
+function throwingSettingsRepository(): DesktopAppSettingsRepository {
+  return {
+    async getModeSystemPromptOverride() {
+      throw new Error('mode override should not be read when memory is disabled');
+    },
+    async getPinnedFacts() {
+      throw new Error('pinned facts should not be read when memory is disabled');
+    },
+    async getUserProfile() {
+      throw new Error('user profile should not be read when memory is disabled');
+    },
+  } as unknown as DesktopAppSettingsRepository;
+}
+
+function throwingMemoryRepository(): DesktopMemoryRepository {
+  return {
+    async getSessionSummaries() {
+      throw new Error('summaries should not be read when memory is disabled');
+    },
+  } as unknown as DesktopMemoryRepository;
+}
+
 async function fileExists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -273,6 +541,12 @@ const tests: Array<[string, () => Promise<void>]> = [
   ['download service', testDownloadService],
   ['download failure cleanup', testDownloadFailureDeletesPartial],
   ['model registry and server command', testModelRegistryAndServerCommand],
+  ['chat max tokens env default', testChatMaxTokensEnvDefault],
+  ['context budget keeps newest summaries', testContextBudgetKeepsNewestSummaries],
+  ['chat defaults to no memory context', testChatDefaultsToNoMemoryContext],
+  ['chat with memory includes memory context', testChatWithMemoryIncludesMemoryContext],
+  ['CLI rejects embedding flags without memory', testCliRejectsEmbeddingFlagsWithoutMemory],
+  ['profile sanitizer', testProfileSanitizer],
 ];
 
 for (const [name, test] of tests) {
