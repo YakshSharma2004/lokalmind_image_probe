@@ -12,6 +12,7 @@ const npmCommand = 'npm';
 const rl = createInterface({ input, output });
 
 let llamaServerBin = null;
+const serverExeName = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server';
 
 async function main() {
   process.chdir(packageRoot);
@@ -85,7 +86,7 @@ async function printMenu() {
   }
   console.log(`Embedding model: ${embeddingState}`);
   console.log('');
-  console.log('1. Configure llama-server.exe path');
+  console.log(`1. Configure ${serverExeName} path`);
   console.log('2. List all registered models');
   console.log('3. Download a model');
   console.log('4. Download embedding model');
@@ -98,12 +99,12 @@ async function printMenu() {
 }
 
 async function configureLlamaServerPath() {
-  const answer = await ask('Enter full path to llama-server.exe, or press Enter to auto-detect: ');
+  const answer = await ask(`Enter full path to ${serverExeName}, or press Enter to auto-detect: `);
   const cleaned = cleanPath(answer);
 
   if (cleaned) {
     if (!isAbsolute(cleaned)) {
-      console.log('Please provide a full absolute path to llama-server.exe.');
+      console.log(`Please provide a full absolute path to ${serverExeName}.`);
       return;
     }
     const normalized = await normalizeLlamaServerPath(cleaned);
@@ -271,13 +272,15 @@ async function printManualChatFallback(modelId, message, useMemory, useEmbedding
     if (embeddingPath) {
       console.log('');
       console.log('Terminal 2:');
+      const binPart = quoteShell(llamaServerBin);
+      const binCommand = process.platform === 'win32' && binPart.startsWith("'") ? `& ${binPart}` : binPart;
       console.log(
-        `${quotePowerShell(llamaServerBin)} -m ${quotePowerShell(embeddingPath)} --embedding --pooling mean -c 512 --host 127.0.0.1 --port 8081`,
+        `${binCommand} -m ${quoteShell(embeddingPath)} --embedding --pooling mean -c 512 --host 127.0.0.1 --port 8081`,
       );
       console.log('');
       console.log('Terminal 3:');
       console.log(
-        `npm run chat -- --model ${modelId} --server http://127.0.0.1:8080 --with-memory --embedding-server http://127.0.0.1:8081 --message ${quotePowerShell(message)}`,
+        `npm run chat -- --model ${modelId} --server http://127.0.0.1:8080 --with-memory --embedding-server http://127.0.0.1:8081 --message ${quoteShell(message)}`,
       );
       return;
     }
@@ -286,7 +289,7 @@ async function printManualChatFallback(modelId, message, useMemory, useEmbedding
   console.log('');
   console.log('Terminal 2:');
   const memoryArgs = useMemory ? ' --with-memory --no-embeddings' : '';
-  console.log(`npm run chat -- --model ${modelId} --server http://127.0.0.1:8080${memoryArgs} --message ${quotePowerShell(message)}`);
+  console.log(`npm run chat -- --model ${modelId} --server http://127.0.0.1:8080${memoryArgs} --message ${quoteShell(message)}`);
 }
 
 async function printManualProbeFallback(modelId) {
@@ -323,7 +326,7 @@ async function resolveLlamaServerBin(settings, shouldAsk) {
   }
 
   if (shouldAsk) {
-    const answer = await ask('Enter full path to llama-server.exe, or press Enter to auto-detect: ');
+    const answer = await ask(`Enter full path to ${serverExeName}, or press Enter to auto-detect: `);
     const provided = cleanPath(answer);
     if (provided) {
       const normalized = isAbsolute(provided) ? await normalizeLlamaServerPath(provided) : null;
@@ -336,11 +339,13 @@ async function resolveLlamaServerBin(settings, shouldAsk) {
 }
 
 async function detectLlamaServerBin() {
-  const onPath = await findExecutableOnPath('llama-server');
+  const onPath = await findExecutableOnPath(serverExeName);
   if (onPath) return onPath;
 
-  const wingetPath = knownWingetLlamaServerPath();
-  if (wingetPath && await isFile(wingetPath)) return wingetPath;
+  if (process.platform === 'win32') {
+    const wingetPath = knownWingetLlamaServerPath();
+    if (wingetPath && await isFile(wingetPath)) return wingetPath;
+  }
 
   return null;
 }
@@ -445,7 +450,7 @@ async function normalizeLlamaServerPath(candidate) {
     const info = await stat(candidate);
     if (info.isFile()) return candidate;
     if (info.isDirectory()) {
-      const nested = join(candidate, process.platform === 'win32' ? 'llama-server.exe' : 'llama-server');
+      const nested = join(candidate, serverExeName);
       return await isFile(nested) ? nested : null;
     }
     return null;
@@ -516,9 +521,14 @@ function isSpawnFailure(result) {
 
 function printLlamaServerMissing() {
   console.log('llama-server was not found.');
-  console.log('Install it with:');
-  console.log('winget install --id ggml.llamacpp --exact');
-  console.log('Or use menu option 1 to provide the full path to llama-server.exe.');
+  if (process.platform === 'win32') {
+    console.log('Install it with:');
+    console.log('winget install --id ggml.llamacpp --exact');
+    console.log(`Or use menu option 1 to provide the full path to ${serverExeName}.`);
+  } else {
+    console.log('Install it via your package manager (e.g., brew or apt) or build it from source.');
+    console.log(`Or use menu option 1 to provide the full path to ${serverExeName}.`);
+  }
 }
 
 function cleanPath(value) {
@@ -527,8 +537,11 @@ function cleanPath(value) {
   return trimmed.replace(/^["']|["']$/g, '');
 }
 
-function quotePowerShell(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+function quoteShell(value) {
+  if (process.platform === 'win32') {
+    return `'${String(value).replace(/'/g, "''")}'`;
+  }
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function isYes(value) {
@@ -548,3 +561,13 @@ main()
   .finally(() => {
     rl.close();
   });
+
+process.on('SIGINT', () => {
+  rl.close();
+  process.exit(130);
+});
+
+process.on('SIGTERM', () => {
+  rl.close();
+  process.exit(143);
+});

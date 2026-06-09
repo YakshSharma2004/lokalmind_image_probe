@@ -49,6 +49,29 @@ import { scoreVisionAnswer } from './domain/scoreVisionAnswer.js';
 import { testCases } from './domain/testCases.js';
 import type { ChatMode, DownloadedModelState, ModelArtifact, ProbeResultRecord, ProbeRun, TestCase } from './types.js';
 
+const activeServerHandles: ManagedLlamaServerHandle[] = [];
+
+async function cleanupAndExit(code: number): Promise<void> {
+  const handles = [...activeServerHandles];
+  activeServerHandles.length = 0;
+  for (const handle of handles) {
+    try {
+      await handle.stop();
+    } catch {
+      // ignore
+    }
+  }
+  process.exit(code);
+}
+
+process.on('SIGINT', () => {
+  cleanupAndExit(130).catch(() => process.exit(130));
+});
+
+process.on('SIGTERM', () => {
+  cleanupAndExit(143).catch(() => process.exit(143));
+});
+
 export interface ParsedArgs {
   command:
     | 'probe'
@@ -422,6 +445,7 @@ async function runProbe(args: ParsedArgs): Promise<number> {
       port,
       contextSize,
     });
+    activeServerHandles.push(managedServer);
     serverUrl = managedServer.serverUrl;
     serverCommand = managedServer.command;
   }
@@ -500,8 +524,12 @@ async function runProbe(args: ParsedArgs): Promise<number> {
   } finally {
     if (managedServer && !args.keepServerAlive) {
       await managedServer.stop();
+      const idx = activeServerHandles.indexOf(managedServer);
+      if (idx !== -1) activeServerHandles.splice(idx, 1);
     } else if (managedServer && args.keepServerAlive) {
       console.log(`Keeping llama-server alive at ${managedServer.serverUrl}`);
+      const idx = activeServerHandles.indexOf(managedServer);
+      if (idx !== -1) activeServerHandles.splice(idx, 1);
     }
     driver.close();
   }
@@ -712,6 +740,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
         port,
         contextSize: args.contextSize ?? artifact.contextSize,
       });
+      activeServerHandles.push(managedChatServer);
       serverUrl = managedChatServer.serverUrl;
       debugLog?.(`[chat-cli] llama-server ready at ${serverUrl}`);
     }
@@ -731,6 +760,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
         contextSize: embeddingArtifact.contextSize,
         pooling: args.embeddingPooling ?? 'mean',
       });
+      activeServerHandles.push(managedEmbeddingServer);
       embeddingServerUrl = managedEmbeddingServer.serverUrl;
       debugLog?.(`[chat-cli] embedding server ready at ${embeddingServerUrl}`);
     }
@@ -803,13 +833,21 @@ async function runChat(args: ParsedArgs): Promise<number> {
     driver?.close();
     if (managedEmbeddingServer && !args.keepServerAlive) {
       await managedEmbeddingServer.stop();
+      const idx = activeServerHandles.indexOf(managedEmbeddingServer);
+      if (idx !== -1) activeServerHandles.splice(idx, 1);
     } else if (managedEmbeddingServer && args.keepServerAlive) {
       console.log(`Keeping embedding llama-server alive at ${managedEmbeddingServer.serverUrl}`);
+      const idx = activeServerHandles.indexOf(managedEmbeddingServer);
+      if (idx !== -1) activeServerHandles.splice(idx, 1);
     }
     if (managedChatServer && !args.keepServerAlive) {
       await managedChatServer.stop();
+      const idx = activeServerHandles.indexOf(managedChatServer);
+      if (idx !== -1) activeServerHandles.splice(idx, 1);
     } else if (managedChatServer && args.keepServerAlive) {
       console.log(`Keeping llama-server alive at ${managedChatServer.serverUrl}`);
+      const idx = activeServerHandles.indexOf(managedChatServer);
+      if (idx !== -1) activeServerHandles.splice(idx, 1);
     }
   }
 }
@@ -857,26 +895,65 @@ function formatDate(timestamp: number | null): string {
   return timestamp ? new Date(timestamp).toISOString() : '(not completed)';
 }
 
-function printRunSummary(run: ProbeRun, results: ProbeResultRecord[], verdict: string, explanation: string): void {
-  console.log(`Run: ${run.id}`);
-  console.log(`Model: ${run.modelId} (${run.modelLabel})`);
-  console.log(`Server: ${run.serverUrl}`);
-  console.log(`Started: ${formatDate(run.startedAt)}`);
-  console.log(`Completed: ${formatDate(run.completedAt)}`);
-  console.log(`Status: ${run.status}`);
-  console.log('');
+export function formatRunSummary(
+  run: ProbeRun,
+  results: ProbeResultRecord[],
+  verdict: string,
+  explanation: string,
+): string {
+  const lines: string[] = [
+    `Run: ${run.id}`,
+    `Model: ${run.modelId} (${run.modelLabel})`,
+    `Server: ${run.serverUrl}`,
+    `Started: ${formatDate(run.startedAt)}`,
+    `Completed: ${formatDate(run.completedAt)}`,
+    `Status: ${run.status}`,
+    '',
+  ];
 
   for (const testCase of testCases) {
     const image = results.find((result) => result.testId === testCase.id && result.withImage);
     const control = results.find((result) => result.testId === testCase.id && !result.withImage);
     const imageScore = image?.score ?? 'missing';
     const controlScore = control?.score ?? 'missing';
-    console.log(`${testCase.id.padEnd(20)} image=${imageScore.toString().padEnd(14)} control=${controlScore}`);
+    lines.push(`${testCase.id.padEnd(20)} image=${imageScore.toString().padEnd(14)} control=${controlScore}`);
   }
 
-  console.log('');
-  console.log(`Verdict: ${verdict}`);
-  console.log(explanation);
+  lines.push('');
+  lines.push('LLM Responses');
+  lines.push('');
+
+  for (const testCase of testCases) {
+    const image = results.find((result) => result.testId === testCase.id && result.withImage);
+    const control = results.find((result) => result.testId === testCase.id && !result.withImage);
+    lines.push(testCase.id);
+    appendResponseBlock(lines, 'image', image);
+    appendResponseBlock(lines, 'control', control);
+    lines.push('');
+  }
+
+  lines.push(`Verdict: ${verdict}`);
+  lines.push(explanation);
+  return lines.join('\n');
+}
+
+function printRunSummary(run: ProbeRun, results: ProbeResultRecord[], verdict: string, explanation: string): void {
+  console.log(formatRunSummary(run, results, verdict, explanation));
+}
+
+function appendResponseBlock(lines: string[], label: 'image' | 'control', result: ProbeResultRecord | undefined): void {
+  lines.push(`  ${label} score=${result?.score ?? 'missing'}`);
+  lines.push('  response:');
+  lines.push(...formatIndentedText(result?.responseText, '    '));
+  if (result?.error) {
+    lines.push('  error:');
+    lines.push(...formatIndentedText(result.error, '    '));
+  }
+}
+
+function formatIndentedText(value: string | null | undefined, indent: string): string[] {
+  if (!value || value.trim().length === 0) return [`${indent}(no response)`];
+  return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').map((line) => `${indent}${line}`);
 }
 
 async function runReport(): Promise<number> {

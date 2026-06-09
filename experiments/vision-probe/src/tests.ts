@@ -6,7 +6,7 @@ import { imagePathToDataUrl, LlamaServerVisionAdapter } from './adapters/LlamaSe
 import { buildLlamaServerArgs } from './adapters/ManagedLlamaServer.js';
 import { NodeDownloadService } from './adapters/NodeDownloadService.js';
 import { NodeSQLiteDriver } from './adapters/NodeSQLiteDriver.js';
-import { validateChatArgs } from './cli.js';
+import { formatRunSummary, validateChatArgs } from './cli.js';
 import { resolveChatMaxTokens } from './config.js';
 import type { DesktopAppSettingsRepository } from './data/DesktopAppSettingsRepository.js';
 import type { DesktopMemoryRepository } from './data/DesktopMemoryRepository.js';
@@ -140,6 +140,80 @@ async function testSQLiteRepository(): Promise<void> {
     assert.equal(report.results[0]?.score, 'pass');
     driver.close();
   });
+}
+
+async function testReportFormattingIncludesRawResponses(): Promise<void> {
+  const now = Date.now();
+  const output = formatRunSummary(
+    {
+      id: 'run-1',
+      modelId: 'test-model',
+      modelLabel: 'Test Model',
+      serverUrl: 'http://localhost:8080',
+      serverCommand: null,
+      startedAt: now,
+      completedAt: now,
+      status: 'completed',
+      notes: null,
+    },
+    [
+      {
+        id: 'result-image',
+        runId: 'run-1',
+        testId: 'shapes-basic',
+        imagePath: 'shapes-basic.png',
+        prompt: 'List shapes.',
+        withImage: true,
+        responseText: 'red circle\nblue square',
+        expectedSignals: '[]',
+        forbiddenSignals: '[]',
+        score: 'pass',
+        latencyMs: 12,
+        error: null,
+        createdAt: now,
+      },
+      {
+        id: 'result-control',
+        runId: 'run-1',
+        testId: 'shapes-basic',
+        imagePath: 'shapes-basic.png',
+        prompt: 'List shapes.',
+        withImage: false,
+        responseText: 'I cannot see an image.',
+        expectedSignals: '[]',
+        forbiddenSignals: '[]',
+        score: 'fail',
+        latencyMs: 10,
+        error: null,
+        createdAt: now,
+      },
+      {
+        id: 'result-error',
+        runId: 'run-1',
+        testId: 'ocr-simple',
+        imagePath: 'ocr-simple.png',
+        prompt: 'Read text.',
+        withImage: true,
+        responseText: '',
+        expectedSignals: '[]',
+        forbiddenSignals: '[]',
+        score: 'runtime_error',
+        latencyMs: null,
+        error: 'HTTP 500',
+        createdAt: now,
+      },
+    ],
+    'maybe_vision_capable',
+    'Passed 1/4 image tests.',
+  );
+
+  assert.match(output, /shapes-basic\s+image=pass\s+control=fail/);
+  assert.match(output, /LLM Responses/);
+  assert.match(output, /shapes-basic[\s\S]*image score=pass[\s\S]*red circle[\s\S]*blue square/);
+  assert.match(output, /shapes-basic[\s\S]*control score=fail[\s\S]*I cannot see an image\./);
+  assert.match(output, /ocr-simple[\s\S]*image score=runtime_error[\s\S]*\(no response\)[\s\S]*error:[\s\S]*HTTP 500/);
+  assert.match(output, /Verdict: maybe_vision_capable/);
+  assert.match(output, /Passed 1\/4 image tests\./);
 }
 
 async function testAdapterFetchPayload(): Promise<void> {
@@ -532,11 +606,33 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
+async function testSignalHandlersRegistered(): Promise<void> {
+  const sigintListeners = process.listeners('SIGINT');
+  const sigtermListeners = process.listeners('SIGTERM');
+  assert.ok(sigintListeners.length > 0, 'SIGINT listener should be registered');
+  assert.ok(sigtermListeners.length > 0, 'SIGTERM listener should be registered');
+}
+
+function quoteShell(value: string, platform: string): string {
+  if (platform === 'win32') {
+    return `'${String(value).replace(/'/g, "''")}'`;
+  }
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+async function testShellQuotingBehavior(): Promise<void> {
+  assert.equal(quoteShell('hello', 'win32'), "'hello'");
+  assert.equal(quoteShell("don't", 'win32'), "'don''t'");
+  assert.equal(quoteShell('hello', 'linux'), "'hello'");
+  assert.equal(quoteShell("don't", 'linux'), "'don'\\''t'");
+}
+
 const tests: Array<[string, () => Promise<void>]> = [
   ['fixture generation', testFixtureGeneration],
   ['base64 encoding and request shape', testBase64EncodingAndRequestShape],
   ['scoring', testScoring],
   ['sqlite repository', testSQLiteRepository],
+  ['report formatting includes raw responses', testReportFormattingIncludesRawResponses],
   ['adapter fetch payload', testAdapterFetchPayload],
   ['download service', testDownloadService],
   ['download failure cleanup', testDownloadFailureDeletesPartial],
@@ -547,9 +643,12 @@ const tests: Array<[string, () => Promise<void>]> = [
   ['chat with memory includes memory context', testChatWithMemoryIncludesMemoryContext],
   ['CLI rejects embedding flags without memory', testCliRejectsEmbeddingFlagsWithoutMemory],
   ['profile sanitizer', testProfileSanitizer],
+  ['signal handlers registered', testSignalHandlersRegistered],
+  ['shell quoting behavior', testShellQuotingBehavior],
 ];
 
 for (const [name, test] of tests) {
   await test();
   console.log(`ok - ${name}`);
 }
+

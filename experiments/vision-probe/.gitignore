@@ -2,3 +2,8 @@
 dist/
 node_modules/
 *.tsbuildinfo
+.agents
+/LLM_CONTEXT.md
+/OPEN_SOURCE_USAGE.md
+/ORIGINAL_REQUEST.md
+/PROJECT.md

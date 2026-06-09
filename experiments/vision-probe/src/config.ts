@@ -17,7 +17,7 @@ export const defaultProbeConfig = {
   serverUrl: 'http://127.0.0.1:8080',
   temperature: 0,
   maxTokens: 128,
-  timeoutMs: 120_000,
+  timeoutMs: 1_200_000,
 } as const;
 
 const DEFAULT_CHAT_MAX_TOKENS = 512;

@@ -31,7 +31,7 @@ const appCatalogModels = [
     id: 'qwen3.5-4b',
     label: 'Qwen 3.5 - 4B',
     filename: 'Qwen_Qwen3.5-4B-Q4_K_M.gguf',
-    sizeBytes: 2_856_936_448,
+    sizeBytes: 2_856_936_480,
     contextSize: 32_768,
     notes: 'App catalog Qwen text model. Included so the probe can verify whether image payloads are rejected or ignored.',
   },

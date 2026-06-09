@@ -189,24 +189,48 @@ async function waitForServerHealthy(
 }
 
 function formatSpawnError(binary: string, command: string, error: Error): string {
-  const code = 'code' in error ? String(error.code) : '';
+  const code = 'code' in error ? String((error as any).code) : '';
+  const isWin = process.platform === 'win32';
   if (code === 'ENOENT') {
-    return [
-      `Could not start "${binary}" because it was not found on PATH.`,
-      'Install llama.cpp/llama-server, or pass the full executable path with:',
-      `  --llama-server-bin "C:\\path\\to\\llama-server.exe"`,
-      '',
-      `Command attempted: ${command}`,
-    ].join('\n');
+    if (isWin) {
+      return [
+        `Could not start "${binary}" because it was not found on PATH.`,
+        'Install llama.cpp/llama-server via Winget:',
+        '  winget install --id ggml.llamacpp --exact',
+        'Or pass the full executable path with:',
+        `  --llama-server-bin "C:\\path\\to\\llama-server.exe"`,
+        '',
+        `Command attempted: ${command}`,
+      ].join('\n');
+    } else {
+      return [
+        `Could not start "${binary}" because it was not found on PATH.`,
+        'Check if llama-server is installed, is in your PATH, or check executable permissions (chmod +x).',
+        'Or pass the full executable path with:',
+        `  --llama-server-bin "/path/to/llama-server"`,
+        '',
+        `Command attempted: ${command}`,
+      ].join('\n');
+    }
   }
   if (code === 'EPERM') {
-    return [
-      `Could not start "${binary}" because Node was not allowed to spawn the process.`,
-      'This can happen in restricted terminals even when PowerShell can run the exe directly.',
-      'Use manual server mode: start llama-server in separate PowerShell windows, then run the CLI with --server and --embedding-server instead of --auto-server.',
-      '',
-      `Command attempted: ${command}`,
-    ].join('\n');
+    if (isWin) {
+      return [
+        `Could not start "${binary}" because Node was not allowed to spawn the process.`,
+        'This can happen in restricted terminals even when PowerShell can run the exe directly.',
+        'Use manual server mode: start llama-server in separate PowerShell windows, then run the CLI with --server and --embedding-server instead of --auto-server.',
+        '',
+        `Command attempted: ${command}`,
+      ].join('\n');
+    } else {
+      return [
+        `Could not start "${binary}" because Node was not allowed to spawn the process.`,
+        'Check executable permissions (chmod +x) or if the path is correct.',
+        'Use manual server mode: start llama-server in a separate terminal window, then run the CLI with --server and --embedding-server instead of --auto-server.',
+        '',
+        `Command attempted: ${command}`,
+      ].join('\n');
+    }
   }
   return `Could not start "${binary}": ${error.message}\nCommand attempted: ${command}`;
 }
