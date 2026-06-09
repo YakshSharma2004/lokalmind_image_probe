@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 export const packageRoot = resolve(here, '..');
 
-export const dataDir = resolve(packageRoot, '.data');
+const envDataDir = process.env.VISION_PROBE_DATA_DIR?.trim();
+export const dataDir = envDataDir ? resolve(envDataDir) : resolve(packageRoot, '.data');
 export const defaultFixtureDir = resolve(dataDir, 'fixtures');
 export const defaultDbPath = resolve(dataDir, 'vision-probe.db');
 export const defaultSettingsPath = resolve(dataDir, 'settings.json');

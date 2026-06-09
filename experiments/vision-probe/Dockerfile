@@ -35,6 +35,7 @@ EXPOSE 8080 8081
 
 # Default environment variables
 ENV VISION_PROBE_MODEL_BASE_URL="https://lokalmind-models.sandipan-lokalmind.workers.dev"
+ENV VISION_PROBE_DATA_DIR="/app/.data"
 
 # The command is kept flexible. Users can override it to run wizard, chat, or probe.
 CMD ["npm", "run", "wizard"]
