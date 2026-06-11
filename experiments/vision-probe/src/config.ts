@@ -21,7 +21,7 @@ export const defaultProbeConfig = {
   timeoutMs: 1_200_000,
 } as const;
 
-const DEFAULT_CHAT_MAX_TOKENS = 512;
+const DEFAULT_CHAT_MAX_TOKENS = 50000;
 
 export function resolveChatMaxTokens(override?: number): number {
   if (override !== undefined) return override;
