@@ -8,13 +8,8 @@ FROM ghcr.io/ggml-org/llama.cpp:server AS llama-bin
 # ==========================================
 FROM node:26-slim
 
-# Install system dependencies (curl for healthchecks, etc.)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy llama-server from Stage 1 into system path
-COPY --from=llama-bin /llama-server /usr/local/bin/llama-server
+COPY --from=llama-bin /app/llama-server /usr/local/bin/llama-server
 
 # Set working directory inside the container
 WORKDIR /app
