@@ -1,4 +1,5 @@
 import type { ISQLiteDriver } from '../adapters/NodeSQLiteDriver.js';
+export type { ISQLiteDriver };
 
 export async function initializeSchema(driver: ISQLiteDriver): Promise<void> {
   await driver.execute(`

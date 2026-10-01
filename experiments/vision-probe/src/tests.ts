@@ -18,6 +18,7 @@ import { getModelArtifact, resolveModelUrl } from './domain/modelArtifacts.js';
 import { buildDeterministicProfile, sanitizeUserProfile } from './domain/persistentMemoryMaintenance.js';
 import { runPersistentChatTurn } from './domain/runPersistentChatTurn.js';
 import { computeVisionVerdict, scoreVisionAnswer } from './domain/scoreVisionAnswer.js';
+import { cosineSimilarity, keywordScore, parseEmbedding, retrieveChunks } from './domain/datasetRetrieval.js';
 import { testCases } from './domain/testCases.js';
 import { generateFixtures } from './fixtures/generateFixtures.js';
 import type { PersistentChatMessage, ProbeMessage, SessionMemory, SessionSummary } from './types.js';
@@ -342,11 +343,11 @@ async function testChatMaxTokensEnvDefault(): Promise<void> {
   const previous = process.env.CHAT_MAX_TOKENS;
   try {
     delete process.env.CHAT_MAX_TOKENS;
-    assert.equal(resolveChatMaxTokens(), 512);
+    assert.equal(resolveChatMaxTokens(), 50000);
     process.env.CHAT_MAX_TOKENS = '2048';
     assert.equal(resolveChatMaxTokens(), 2048);
     process.env.CHAT_MAX_TOKENS = 'not-a-number';
-    assert.equal(resolveChatMaxTokens(), 512);
+    assert.equal(resolveChatMaxTokens(), 50000);
     assert.equal(resolveChatMaxTokens(99), 99);
   } finally {
     if (previous === undefined) {
@@ -620,6 +621,87 @@ function quoteShell(value: string, platform: string): string {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
+async function testDatasetRetrieval(): Promise<void> {
+  // 1. parseEmbedding
+  assert.deepEqual(parseEmbedding(null), []);
+  assert.deepEqual(parseEmbedding(''), []);
+  assert.deepEqual(parseEmbedding('invalid json'), []);
+  assert.deepEqual(parseEmbedding('[1, 2.5, "foo", null, 3]'), [1, 2.5, 3]);
+
+  // 2. cosineSimilarity
+  assert.equal(cosineSimilarity([], [1, 2]), 0);
+  assert.equal(cosineSimilarity([1, 0], [0, 1]), 0);
+  assert.equal(cosineSimilarity([1, 2, 3], [1, 2, 3]), 1);
+  assert.ok(Math.abs(cosineSimilarity([1, 0], [1, 1]) - 0.7071) < 0.001);
+
+  // 3. keywordScore
+  assert.equal(keywordScore('the and for', 'some content'), 0); // all stop words or short
+  assert.equal(keywordScore('cat dog', 'The cat ran away'), 0.5); // cat matches, dog does not
+  assert.equal(keywordScore('cat dog', 'The cat and the dog ran away'), 1.0);
+
+  // 4. retrieveChunks with mock repo and mock embedding client
+  const mockChunks = [
+    {
+      id: '1',
+      dataset: 'ds1',
+      sourceFile: 'fileA.txt',
+      chunkIndex: 0,
+      content: 'Deep learning neural networks with transformer architecture.',
+      embedding: JSON.stringify([1, 0, 0]),
+      createdAt: 100,
+    },
+    {
+      id: '2',
+      dataset: 'ds1',
+      sourceFile: 'fileB.txt',
+      chunkIndex: 0,
+      content: 'Quantum computing uses qubits and superposition.',
+      embedding: JSON.stringify([0, 1, 0]),
+      createdAt: 100,
+    },
+  ];
+
+  const mockRepo = {
+    insertChunk: async () => {},
+    deleteDataset: async () => {},
+    countChunks: async () => 2,
+    getChunksByDataset: async (dataset: string) => (dataset === 'ds1' ? mockChunks : []),
+    listDatasets: async () => [{ dataset: 'ds1', chunkCount: 2, embeddedCount: 2 }],
+  };
+
+  const mockEmbeddingClient = {
+    isReady: () => true,
+    embed: async (query: string) => (query.includes('neural') ? [0.9, 0.1, 0] : [0, 0, 1]),
+  };
+
+  // Vector retrieval match
+  const resultsEmbedding = await retrieveChunks({
+    repository: mockRepo,
+    embedding: mockEmbeddingClient,
+    dataset: 'ds1',
+    query: 'neural networks',
+  });
+  assert.equal(resultsEmbedding.length, 1);
+  assert.equal(resultsEmbedding[0]?.chunk.id, '1');
+  assert.equal(resultsEmbedding[0]?.method, 'embedding');
+
+  // Keyword fallback match (when embedding returns no similarity above threshold)
+  const noMatchEmbeddingClient = {
+    isReady: () => false,
+    embed: async () => [],
+  };
+
+  const resultsKeyword = await retrieveChunks({
+    repository: mockRepo,
+    embedding: noMatchEmbeddingClient,
+    dataset: 'ds1',
+    query: 'quantum computing',
+  });
+  assert.equal(resultsKeyword.length, 1);
+  assert.equal(resultsKeyword[0]?.chunk.id, '2');
+  assert.equal(resultsKeyword[0]?.method, 'keyword');
+}
+
 async function testShellQuotingBehavior(): Promise<void> {
   assert.equal(quoteShell('hello', 'win32'), "'hello'");
   assert.equal(quoteShell("don't", 'win32'), "'don''t'");
@@ -644,6 +726,7 @@ const tests: Array<[string, () => Promise<void>]> = [
   ['CLI rejects embedding flags without memory', testCliRejectsEmbeddingFlagsWithoutMemory],
   ['profile sanitizer', testProfileSanitizer],
   ['signal handlers registered', testSignalHandlersRegistered],
+  ['dataset retrieval', testDatasetRetrieval],
   ['shell quoting behavior', testShellQuotingBehavior],
 ];
 

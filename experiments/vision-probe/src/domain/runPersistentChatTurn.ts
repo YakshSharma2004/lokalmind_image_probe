@@ -22,6 +22,7 @@ export interface RunPersistentChatTurnParams {
   maxTokens: number;
   timeoutMs: number;
   memoryEnabled: boolean;
+  groundingContext?: string | undefined;
   debugLog?: ((message: string) => void) | undefined;
 }
 
@@ -73,7 +74,8 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
   params.debugLog?.(
     `[chat] context inputs mode=${params.mode} history_included=${historyOnly.length} ` +
     `summaries=${summaries.length} relevant_memories=${memories.length} ` +
-    `pinned_chars=${pinnedFacts.length} profile_chars=${userProfile.length}`,
+    `pinned_chars=${pinnedFacts.length} profile_chars=${userProfile.length} ` +
+    `grounding_chars=${params.groundingContext?.length ?? 0}`,
   );
 
   const llmMessages = buildContextMessages({
@@ -81,6 +83,7 @@ export async function runPersistentChatTurn(params: RunPersistentChatTurnParams)
     pinnedFacts,
     userProfile,
     crossSessionMemories: memories,
+    groundingContext: params.groundingContext,
     inSessionSummaries: summaries,
     history: historyOnly,
     currentMessage,

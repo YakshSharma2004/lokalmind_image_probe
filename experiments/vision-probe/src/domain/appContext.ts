@@ -90,6 +90,7 @@ interface ContextBudget {
   pinnedFacts: string;
   userProfile: string;
   crossSessionMemories?: SessionMemory[];
+  groundingContext?: string | undefined;
   inSessionSummaries: SessionSummary[];
   history: ProbeMessage[];
   currentMessage: ProbeMessage;
@@ -99,6 +100,7 @@ const BUDGET_SYSTEM = 300;
 const BUDGET_PINNED = 100;
 const BUDGET_USER_PROFILE = 200;
 const BUDGET_CROSS_SESSION = 200;
+const BUDGET_GROUNDING = 1200;
 const BUDGET_IN_SESSION = 150;
 const BUDGET_HISTORY = 800;
 const BUDGET_TOTAL = 3800;
@@ -109,6 +111,7 @@ export function buildContextMessages(params: ContextBudget): ProbeMessage[] {
     pinnedFacts,
     userProfile,
     crossSessionMemories = [],
+    groundingContext,
     inSessionSummaries,
     history,
     currentMessage,
@@ -178,6 +181,14 @@ ${profile}`,
     if (includedMemories.length > 0) {
       systemParts.push(`\n[Past conversations]\n${includedMemories.join('\n\n')}`);
     }
+  }
+
+  if (groundingContext && groundingContext.trim()) {
+    const trimmedGrounding = groundingContext.trim();
+    const grounding = estimateTokens(trimmedGrounding) <= BUDGET_GROUNDING
+      ? trimmedGrounding
+      : trimmedGrounding.slice(0, Math.floor(BUDGET_GROUNDING * 4));
+    systemParts.push(`\n${grounding}`);
   }
 
   if (includedSummaries.length > 0) {

@@ -10,6 +10,7 @@
     "list-models": "tsx src/cli.ts list-models",
     "print-server-command": "tsx src/cli.ts print-server-command",
     "chat": "tsx src/cli.ts chat",
+    "ingest": "tsx src/cli.ts ingest",
     "memory-report": "tsx src/cli.ts memory-report",
     "probe": "tsx src/cli.ts probe",
     "report": "tsx src/cli.ts report",

@@ -1,7 +1,8 @@
-import { access } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { access, readdir, stat, readFile } from 'node:fs/promises';
+import { resolve, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline/promises';
 import {
   defaultDbPath,
   defaultFixtureDir,
@@ -26,12 +27,16 @@ import { NodeDownloadService } from './adapters/NodeDownloadService.js';
 import { NodeKVStorage } from './adapters/NodeKVStorage.js';
 import { NodeSQLiteDriver } from './adapters/NodeSQLiteDriver.js';
 import { initializeSchema } from './data/schema.js';
+import { initializeCaseSchema } from './data/caseSchema.js';
+import { DocumentChunkRepository } from './data/DocumentChunkRepository.js';
 import { VisionProbeRepository } from './data/VisionProbeRepository.js';
 import { DesktopAppSettingsRepository } from './data/DesktopAppSettingsRepository.js';
 import { DesktopMemoryRepository } from './data/DesktopMemoryRepository.js';
 import { PersistentChatRepository } from './data/PersistentChatRepository.js';
 import { isChatMode } from './domain/appContext.js';
 import { buildProbeContext } from './domain/buildProbeContext.js';
+import { extractJsonDocuments, chunkText } from './domain/documentChunking.js';
+import { buildChatGrounding } from './domain/chatGrounding.js';
 import { DesktopMemoryService } from './domain/DesktopMemoryService.js';
 import {
   embeddingArtifact,
@@ -82,6 +87,7 @@ export interface ParsedArgs {
     | 'print-server-command'
     | 'chat'
     | 'memory-report'
+    | 'ingest'
     | 'help';
   model?: string;
   message?: string;
@@ -106,6 +112,9 @@ export interface ParsedArgs {
   keepServerAlive?: boolean;
   force?: boolean;
   debug?: boolean;
+  dataset?: string;
+  path?: string;
+  replace?: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -118,7 +127,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     commandRaw === 'list-models' ||
     commandRaw === 'print-server-command' ||
     commandRaw === 'chat' ||
-    commandRaw === 'memory-report'
+    commandRaw === 'memory-report' ||
+    commandRaw === 'ingest'
       ? commandRaw
       : 'help';
   const args: ParsedArgs = { command };
@@ -192,6 +202,19 @@ function parseArgs(argv: string[]): ParsedArgs {
       case '--with-memory':
         args.withMemory = true;
         break;
+      case '--dataset':
+        if (!next) throw new Error('--dataset requires a value');
+        args.dataset = next;
+        i++;
+        break;
+      case '--path':
+        if (!next) throw new Error('--path requires a value');
+        args.path = next;
+        i++;
+        break;
+      case '--replace':
+        args.replace = true;
+        break;
       case '--llama-server-bin':
         if (!next) throw new Error('--llama-server-bin requires a value');
         args.llamaServerBin = next;
@@ -240,16 +263,15 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 export function validateChatArgs(args: ParsedArgs): void {
   if (!args.model) throw new Error('--model is required');
-  if (!args.message) throw new Error('--message is required');
   if (!args.server && !args.autoServer) throw new Error('chat requires either --server <url> or --auto-server');
   if (args.server && args.autoServer) throw new Error('Use either --server or --auto-server, not both.');
   if (args.embeddingServer && args.autoEmbeddingServer) {
     throw new Error('Use either --embedding-server or --auto-embedding-server, not both.');
   }
-  if (!args.withMemory && (args.embeddingServer || args.autoEmbeddingServer || args.noEmbeddings)) {
-    throw new Error('Memory is disabled by default. Use --with-memory before passing embedding options.');
+  if (!args.withMemory && !args.dataset && (args.embeddingServer || args.autoEmbeddingServer || args.noEmbeddings)) {
+    throw new Error('Memory is disabled by default. Use --with-memory or --dataset before passing embedding options.');
   }
-  if (args.withMemory && args.noEmbeddings && (args.embeddingServer || args.autoEmbeddingServer)) {
+  if ((args.withMemory || args.dataset) && args.noEmbeddings && (args.embeddingServer || args.autoEmbeddingServer)) {
     throw new Error('Use either --no-embeddings or an embedding server option, not both.');
   }
 }
@@ -702,11 +724,111 @@ async function runPrintServerCommand(args: ParsedArgs): Promise<number> {
   return 0;
 }
 
+async function runIngest(args: ParsedArgs): Promise<number> {
+  if (!args.dataset) throw new Error('ingest requires --dataset <name>');
+  if (!args.path) throw new Error('ingest requires --path <fileOrDirectory>');
+
+  const targetPath = resolveFromCwd(args.path);
+  const targetExists = await exists(targetPath);
+  if (!targetExists) throw new Error(`Path not found: ${targetPath}`);
+
+  const driver = new NodeSQLiteDriver(defaultDbPath);
+  await driver.initialize();
+  await initializeCaseSchema(driver);
+  const chunkRepo = new DocumentChunkRepository(driver);
+
+  if (args.replace) {
+    console.log(`Replacing existing dataset: "${args.dataset}"...`);
+    await chunkRepo.deleteDataset(args.dataset);
+  }
+
+  let embeddingAdapter: LlamaServerEmbeddingAdapter | null = null;
+  if (!args.noEmbeddings && args.embeddingServer) {
+    embeddingAdapter = new LlamaServerEmbeddingAdapter(args.embeddingServer);
+    await embeddingAdapter.initialize();
+    console.log(`Using embedding server: ${args.embeddingServer}`);
+  }
+
+  const statInfo = await stat(targetPath);
+  const filesToProcess: string[] = [];
+  if (statInfo.isDirectory()) {
+    const entries = await readdir(targetPath);
+    for (const entry of entries) {
+      if (entry.endsWith('.txt') || entry.endsWith('.md') || entry.endsWith('.json')) {
+        filesToProcess.push(resolve(targetPath, entry));
+      }
+    }
+  } else {
+    filesToProcess.push(targetPath);
+  }
+
+  if (filesToProcess.length === 0) {
+    console.log('No .txt, .md, or .json files found to ingest.');
+    driver.close();
+    return 1;
+  }
+
+  let totalChunksIngested = 0;
+  let totalEmbedded = 0;
+
+  for (const filePath of filesToProcess) {
+    const rawContent = await readFile(filePath, 'utf-8');
+    const baseName = basename(filePath);
+
+    let docItems: Array<{ sourceFile: string; content: string }> = [];
+    if (filePath.endsWith('.json')) {
+      const extracted = extractJsonDocuments(rawContent, baseName);
+      docItems = extracted.map((d) => ({ sourceFile: d.sourceFile, content: d.content }));
+    } else {
+      docItems = [{ sourceFile: baseName, content: rawContent }];
+    }
+
+    let fileChunkCount = 0;
+    let fileEmbeddedCount = 0;
+
+    for (const item of docItems) {
+      const textChunks = chunkText(item.content);
+      for (let idx = 0; idx < textChunks.length; idx++) {
+        const text = textChunks[idx]!;
+        let embeddingJson: string | null = null;
+        if (embeddingAdapter && embeddingAdapter.isReady()) {
+          try {
+            const vec = await embeddingAdapter.embed(text);
+            if (vec.length > 0) {
+              embeddingJson = JSON.stringify(vec);
+              fileEmbeddedCount++;
+            }
+          } catch {
+            // fallback
+          }
+        }
+        await chunkRepo.insertChunk({
+          id: randomUUID(),
+          dataset: args.dataset,
+          sourceFile: item.sourceFile,
+          chunkIndex: idx + 1,
+          content: text,
+          embedding: embeddingJson,
+          createdAt: Date.now(),
+        });
+        fileChunkCount++;
+      }
+    }
+
+    console.log(`  ${baseName}: ${fileChunkCount} chunks (${fileEmbeddedCount} embedded)`);
+    totalChunksIngested += fileChunkCount;
+    totalEmbedded += fileEmbeddedCount;
+  }
+
+  console.log(`Ingested dataset "${args.dataset}": ${totalChunksIngested} total chunks (${totalEmbedded} embedded).`);
+  driver.close();
+  return 0;
+}
+
 async function runChat(args: ParsedArgs): Promise<number> {
   validateChatArgs(args);
   const modelId = args.model;
-  const message = args.message;
-  if (!modelId || !message) throw new Error('chat requires --model and --message');
+  if (!modelId) throw new Error('chat requires --model');
 
   const kv = new NodeKVStorage(defaultSettingsPath);
   const settings = await kv.read();
@@ -720,7 +842,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
   try {
     debugLog?.(
       `[chat-cli] start model=${modelId} mode=${args.mode ?? 'general'} ` +
-      `memory=${Boolean(args.withMemory)} ` +
+      `memory=${Boolean(args.withMemory)} dataset=${args.dataset ?? 'none'} ` +
       `auto_server=${Boolean(args.autoServer)} server=${args.server ?? '(auto)'} ` +
       `auto_embedding=${Boolean(args.autoEmbeddingServer)} embedding_server=${args.embeddingServer ?? '(none)'}`,
     );
@@ -745,7 +867,7 @@ async function runChat(args: ParsedArgs): Promise<number> {
       debugLog?.(`[chat-cli] llama-server ready at ${serverUrl}`);
     }
 
-    if (args.withMemory && args.autoEmbeddingServer) {
+    if ((args.withMemory || args.dataset) && args.autoEmbeddingServer) {
       const downloadedEmbedding = resolveDownloadedEmbedding(settings);
       await verifyDownloadedFiles(embeddingArtifact, downloadedEmbedding);
       const port = args.embeddingPort ?? await getFreePort();
@@ -772,63 +894,127 @@ async function runChat(args: ParsedArgs): Promise<number> {
 
     const repositories = await createPersistentRepositories();
     driver = repositories.driver;
+    await initializeCaseSchema(driver);
+
     const appSettingsRepository = new DesktopAppSettingsRepository(kv);
     const memoryService = new DesktopMemoryService(repositories.memoryRepository);
 
-    if (args.withMemory && !args.noEmbeddings && embeddingServerUrl) {
-      const embeddingAdapter = new LlamaServerEmbeddingAdapter(embeddingServerUrl);
+    let embeddingAdapter: LlamaServerEmbeddingAdapter | null = null;
+    if ((args.withMemory || args.dataset) && !args.noEmbeddings && embeddingServerUrl) {
+      embeddingAdapter = new LlamaServerEmbeddingAdapter(embeddingServerUrl);
       await embeddingAdapter.initialize();
-      memoryService.setEmbeddingService(embeddingAdapter);
+      if (args.withMemory) {
+        memoryService.setEmbeddingService(embeddingAdapter);
+      }
       debugLog?.('[chat-cli] embedding adapter initialized');
+    }
+
+    let chunkRepo: DocumentChunkRepository | null = null;
+    if (args.dataset) {
+      chunkRepo = new DocumentChunkRepository(driver);
     }
 
     const llmAdapter = new LlamaServerVisionAdapter(serverUrl, fetch, debugLog);
     await llmAdapter.initialize();
     debugLog?.('[chat-cli] LLM adapter initialized');
 
-    const result = await runPersistentChatTurn({
-      chatRepository: repositories.chatRepository,
-      memoryRepository: repositories.memoryRepository,
-      appSettingsRepository,
-      memoryService,
-      llmAdapter,
-      modelId,
-      message,
-      mode: args.mode ?? 'general',
-      temperature: args.temperature ?? 0.7,
-      maxTokens: resolveChatMaxTokens(args.maxTokens),
-      timeoutMs: args.timeoutMs ?? defaultProbeConfig.timeoutMs,
-      memoryEnabled: Boolean(args.withMemory),
-      debugLog,
-    });
-
-    console.log(`Model: ${modelId} (${modelLabelFor(modelId)})`);
-    console.log(`Server: ${serverUrl}`);
-    if (managedChatServer) console.log(`Command: ${managedChatServer.command}`);
-    console.log(`Memory: ${args.withMemory ? 'enabled' : 'disabled'}`);
-    if (args.withMemory) {
-      if (embeddingServerUrl) {
-        console.log(`Embeddings: ${embeddingServerUrl}`);
-        if (managedEmbeddingServer) console.log(`Embedding command: ${managedEmbeddingServer.command}`);
-      } else {
-        console.log('Embeddings: score fallback');
+    if (args.message) {
+      let groundingContext = '';
+      if (args.dataset && chunkRepo) {
+        const grounding = await buildChatGrounding({
+          repository: chunkRepo,
+          embedding: embeddingAdapter,
+          dataset: args.dataset,
+          message: args.message,
+        });
+        groundingContext = grounding.block;
       }
+
+      const result = await runPersistentChatTurn({
+        chatRepository: repositories.chatRepository,
+        memoryRepository: repositories.memoryRepository,
+        appSettingsRepository,
+        memoryService,
+        llmAdapter,
+        modelId,
+        message: args.message,
+        mode: args.mode ?? 'general',
+        temperature: args.temperature ?? 0.7,
+        maxTokens: resolveChatMaxTokens(args.maxTokens),
+        timeoutMs: args.timeoutMs ?? defaultProbeConfig.timeoutMs,
+        memoryEnabled: Boolean(args.withMemory),
+        groundingContext,
+        debugLog,
+      });
+
+      console.log(`Model: ${modelId} (${modelLabelFor(modelId)})`);
+      console.log(`Server: ${serverUrl}`);
+      if (managedChatServer) console.log(`Command: ${managedChatServer.command}`);
+      console.log(`Memory: ${args.withMemory ? 'enabled' : 'disabled'}`);
+      if (args.dataset) console.log(`Dataset: ${args.dataset}`);
+      if (args.withMemory || args.dataset) {
+        if (embeddingServerUrl) {
+          console.log(`Embeddings: ${embeddingServerUrl}`);
+          if (managedEmbeddingServer) console.log(`Embedding command: ${managedEmbeddingServer.command}`);
+        } else {
+          console.log('Embeddings: score fallback');
+        }
+      } else {
+        console.log('Embeddings: disabled');
+      }
+      console.log(`Context messages: ${result.contextMessageCount}`);
+      console.log(`Relevant memories: ${result.relevantMemoryCount}`);
+      if (debugLog) {
+        console.log(`Response latency ms: ${result.responseLatencyMs ?? '(none)'}`);
+        console.log(`Assistant chars: ${result.assistantTextLength}`);
+        console.log(`Assistant trimmed chars: ${result.assistantTextTrimmedLength}`);
+      }
+      if (result.assistantTextTrimmedLength === 0) {
+        console.log('Warning: model returned an empty assistant message. Run with --debug or check the debug lines above.');
+      }
+      console.log('');
+      console.log(result.assistantMessage.content);
+      return 0;
     } else {
-      console.log('Embeddings: disabled');
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      console.log(`Entering interactive chat session with model ${modelId} (dataset: ${args.dataset ?? 'none'}). Type 'exit' to quit.\n`);
+      while (true) {
+        const userInput = await rl.question('> ');
+        if (!userInput.trim() || userInput.trim().toLowerCase() === 'exit') break;
+
+        let groundingContext = '';
+        if (args.dataset && chunkRepo) {
+          const grounding = await buildChatGrounding({
+            repository: chunkRepo,
+            embedding: embeddingAdapter,
+            dataset: args.dataset,
+            message: userInput,
+          });
+          groundingContext = grounding.block;
+        }
+
+        const turnResult = await runPersistentChatTurn({
+          chatRepository: repositories.chatRepository,
+          memoryRepository: repositories.memoryRepository,
+          appSettingsRepository,
+          memoryService,
+          llmAdapter,
+          modelId,
+          message: userInput,
+          mode: args.mode ?? 'general',
+          temperature: args.temperature ?? 0.7,
+          maxTokens: resolveChatMaxTokens(args.maxTokens),
+          timeoutMs: args.timeoutMs ?? defaultProbeConfig.timeoutMs,
+          memoryEnabled: Boolean(args.withMemory),
+          groundingContext,
+          debugLog,
+        });
+
+        console.log(`\n${turnResult.assistantMessage.content}\n`);
+      }
+      rl.close();
+      return 0;
     }
-    console.log(`Context messages: ${result.contextMessageCount}`);
-    console.log(`Relevant memories: ${result.relevantMemoryCount}`);
-    if (debugLog) {
-      console.log(`Response latency ms: ${result.responseLatencyMs ?? '(none)'}`);
-      console.log(`Assistant chars: ${result.assistantTextLength}`);
-      console.log(`Assistant trimmed chars: ${result.assistantTextTrimmedLength}`);
-    }
-    if (result.assistantTextTrimmedLength === 0) {
-      console.log('Warning: model returned an empty assistant message. Run with --debug or check the debug lines above.');
-    }
-    console.log('');
-    console.log(result.assistantMessage.content);
-    return 0;
   } finally {
     driver?.close();
     if (managedEmbeddingServer && !args.keepServerAlive) {
@@ -978,21 +1164,23 @@ async function main(): Promise<void> {
     return;
   }
   const code =
-    args.command === 'probe'
-      ? await runProbe(args)
-      : args.command === 'download-model'
-        ? await runDownloadModel(args)
-        : args.command === 'download-embedding'
-          ? await runDownloadEmbedding(args)
-          : args.command === 'list-models'
-            ? await runListModels()
-            : args.command === 'print-server-command'
-              ? await runPrintServerCommand(args)
-              : args.command === 'chat'
-                ? await runChat(args)
-                : args.command === 'memory-report'
-                  ? await runMemoryReport()
-                  : await runReport();
+    args.command === 'ingest'
+      ? await runIngest(args)
+      : args.command === 'probe'
+        ? await runProbe(args)
+        : args.command === 'download-model'
+          ? await runDownloadModel(args)
+          : args.command === 'download-embedding'
+            ? await runDownloadEmbedding(args)
+            : args.command === 'list-models'
+              ? await runListModels()
+              : args.command === 'print-server-command'
+                ? await runPrintServerCommand(args)
+                : args.command === 'chat'
+                  ? await runChat(args)
+                  : args.command === 'memory-report'
+                    ? await runMemoryReport()
+                    : await runReport();
   process.exitCode = code;
 }
 
